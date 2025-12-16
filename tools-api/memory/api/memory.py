@@ -7,7 +7,6 @@ import requests
 from fastapi import APIRouter, HTTPException
 from services.qdrant_client import _client, _ensure_collection
 from services.embedder import embed_messages, embed
-from services.summarizer import summarize
 from utils.schemas import SaveRequest, SearchRequest, MemoryResult
 from qdrant_client.http import models
 
@@ -18,12 +17,48 @@ collection_name = os.getenv("INDEX_NAME", "user_memory_collection")
 PRAGMATICS_HOST = os.getenv("PRAGMATICS_HOST", "pragmatics_api")
 PRAGMATICS_PORT = os.getenv("PRAGMATICS_PORT", "8001")
 
+# Keywords that indicate document/reference material being shared (should always save)
+# These are phrases that indicate PROVIDING content, not asking about it
+DOCUMENT_SHARE_PHRASES = [
+    "please parse", "here's my", "here is my", "this is my", "store this",
+    "keep this", "save this", "remember this document", "for future reference",
+    "here's a document", "this document", "attached document", "below is",
+]
+
+def _has_document_intent(text: str) -> bool:
+    """
+    Check if the message contains document/reference sharing intent.
+    This is a fallback heuristic for when the classifier misses document uploads.
+    Only triggers on SHARING phrases, not questions about documents.
+    """
+    text_lower = text.lower().strip()
+    
+    # Exclude questions - they're recalls, not saves
+    if text_lower.startswith(("do you", "can you", "what is", "what's", "where is", 
+                              "how do", "have you", "did you", "does ", "is there",
+                              "are there", "could you", "would you", "will you")):
+        return False
+    if "?" in text_lower[:100]:  # Question mark early in text suggests a question
+        return False
+    
+    # Check for sharing phrases
+    for phrase in DOCUMENT_SHARE_PHRASES:
+        if phrase in text_lower:
+            return True
+    
+    # Long messages (>500 chars) that don't look like questions are likely documents
+    if len(text) > 500:
+        return True
+    
+    return False
+
 def _is_worth_saving(messages: list) -> bool:
     """
     Determine if a conversation is worth saving to memory.
     Calls the pragmatics classifier service to decide if the user's message
     indicates intent to remember/save information.
     Returns True if pragmatics says save, or on any error (fail-open).
+    Also returns True for document/reference sharing (heuristic fallback).
     """
     # Extract the last user message to send to pragmatics
     user_text = None
@@ -37,6 +72,11 @@ def _is_worth_saving(messages: list) -> bool:
         print("[_is_worth_saving] No user message found, defaulting to save")
         return True
     
+    # Heuristic check: document/reference sharing should always save
+    if _has_document_intent(user_text):
+        print(f"[_is_worth_saving] Document intent detected, forcing save")
+        return True
+    
     try:
         resp = requests.post(
             f"http://{PRAGMATICS_HOST}:{PRAGMATICS_PORT}/api/pragmatic",
@@ -46,7 +86,8 @@ def _is_worth_saving(messages: list) -> bool:
         resp.raise_for_status()
         result = resp.json()
         is_save = result.get("is_save_request", True)
-        print(f"[_is_worth_saving] Pragmatics response: is_save_request={is_save}")
+        confidence = result.get("confidence", 0.0)
+        print(f"[_is_worth_saving] Pragmatics response: is_save_request={is_save}, confidence={confidence:.4f}")
         return is_save
     except Exception as e:
         # Fail open: if pragmatics is down, save anyway
@@ -97,36 +138,18 @@ def save_memory(req: SaveRequest):
     vector = embed_messages(req.messages)
     print(f"[/save] Embedding generated, dim={len(vector)}")
     
-    # Convert messages to dicts for JSON serialization
-    messages_dicts: list[dict] = []
-    for msg in req.messages:
-        if hasattr(msg, 'model_dump'):
-            messages_dicts.append(msg.model_dump())
-        elif isinstance(msg, dict):
-            messages_dicts.append(msg)
-
-    # Build plain text for summary
-    def _collect_plain_text(msgs: list) -> str:
-        parts = []
-        for m in msgs:
-            d = m.model_dump() if hasattr(m, 'model_dump') else m
-            role = d.get("role", "")
-            content = d.get("content", "")
-            if role:
-                parts.append(f"[{role}]")
-            if isinstance(content, str):
-                parts.append(content)
-            elif isinstance(content, list):
-                for item in content:
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        parts.append(item.get("text", ""))
-        return " ".join(parts)
-
-    print("[/save] Generating summary...")
-    summary_text = summarize(_collect_plain_text(req.messages), max_words=60)
-    print(f"[/save] Summary generated: {summary_text[:100]}..." if len(summary_text) > 100 else f"[/save] Summary generated: {summary_text}")
-    store_verbatim = os.getenv("STORE_VERBATIM", "true").lower() == "true"
-    print(f"[/save] store_verbatim={store_verbatim}")
+    # Extract the last user message text for storage
+    user_text = None
+    for msg in reversed(req.messages):
+        msg_dict = msg.model_dump() if hasattr(msg, 'model_dump') else msg
+        if msg_dict.get("role") == "user":
+            user_text = _get_text_content(msg_dict.get("content", ""))
+            break
+    
+    if not user_text:
+        user_text = "[empty message]"
+    
+    print(f"[/save] User text: {user_text[:100]}..." if len(user_text) > 100 else f"[/save] User text: {user_text}")
     
     # Always search for similar memories first (even if we might skip saving)
     client = _client()
@@ -149,7 +172,7 @@ def save_memory(req: SaveRequest):
                     ]
                 },
                 "limit": 5,
-                "score_threshold": 0.9,
+                "score_threshold": 0.3,
                 "with_payload": True,
             },
             timeout=5
@@ -164,10 +187,8 @@ def save_memory(req: SaveRequest):
         if search_results:
             existing_context = [
                 {
-                    "messages": pt.get("payload", {}).get("messages", []),
-                    "summary": pt.get("payload", {}).get("summary"),
+                    "user_text": pt.get("payload", {}).get("user_text", ""),
                     "score": pt.get("score", 0),
-                    "model": pt.get("payload", {}).get("model"),
                 }
                 for pt in search_results
             ]
@@ -204,16 +225,13 @@ def save_memory(req: SaveRequest):
         }
     
     # Always save the new memory (even if similar context was found)
-    content_str = json.dumps(messages_dicts, sort_keys=True)
-    content_hash = hashlib.md5(content_str.encode()).hexdigest()
+    content_hash = hashlib.md5(user_text.encode()).hexdigest()
     
-    # Build payload with full message data
+    # Build payload with user text
     payload: Dict[str, Any] = {
         "user_id": req.user_id,
-        "summary": summary_text,
+        "user_text": user_text,
     }
-    if store_verbatim:
-        payload["messages"] = messages_dicts
     
     point_id = _make_uuid(req.user_id, content_hash)
     

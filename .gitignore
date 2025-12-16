@@ -51,4 +51,4 @@ docker-compose.override.yml
 *.key
 .env.local
 .env.*.local
-open-webui/secrets/
+secrets/

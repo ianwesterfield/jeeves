@@ -6,7 +6,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   git curl && rm -rf /var/lib/apt/lists/*
 
 # Python dependencies (FastAPI + HuggingFace + torch)
+# Pin numpy<2 for torch 2.2.0 compatibility (compiled against NumPy 1.x)
 RUN pip install --no-cache-dir \
+  "numpy<2" \
   fastapi uvicorn[standard] pydantic \
   torch==2.2.0 \
   transformers==4.41.0 \

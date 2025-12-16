@@ -4,7 +4,7 @@ networks:
 
 services:
   # -------------------------------------------------
-  # Ollama (GPU)
+  # Ollama
   # -------------------------------------------------
   ollama:
     image: ollama/ollama:latest
@@ -29,7 +29,7 @@ services:
       - webtools_network
 
   # -------------------------------------------------
-  # Qdrant (vector DB)
+  # Qdrant
   # -------------------------------------------------
   qdrant:
     image: qdrant/qdrant:latest
@@ -47,7 +47,7 @@ services:
       - webtools_network
 
   # -------------------------------------------------
-  # Memory API (tools-api memory service)
+  # Memory API
   # -------------------------------------------------
   memory_api:
     build:
@@ -70,7 +70,7 @@ services:
       - webtools_network
 
   # -------------------------------------------------
-  # Pragmatics service (classifier)
+  # Pragmatics API
   # -------------------------------------------------
   pragmatics_api:
     build:
@@ -86,7 +86,7 @@ services:
       - webtools_network
 
   # -------------------------------------------------
-  # Open-WebUI (UI + orchestration)
+  # Open-WebUI
   # -------------------------------------------------
   open-webui:
     image: ghcr.io/open-webui/open-webui:latest
@@ -98,8 +98,8 @@ services:
       - GLOBAL_LOG_LEVEL=DEBUG
       - OLLAMA_BASE_URL=http://ollama:11434
 
-      - WEBUI_ADMIN_USERNAME=
-      - WEBUI_ADMIN_PASSWORD=
+      - WEBUI_ADMIN_USERNAME=`$(cat ./secrets/webui_username.txt)` # Reference to local file for admin username
+      - WEBUI_ADMIN_PASSWORD=`$(cat ./secrets/webui_password.txt)` # Reference to local file for admin password
 
       - RAG_EMBEDDING_ENGINE=ollama
       - EMBEDDING_MODEL=BAAI/bge-large-en-v1.5
@@ -110,7 +110,7 @@ services:
       - MEMORY_API_URL=http://memory_api:8000
       - TOOLS_DISCOVERY_URL=http://memory_api:8000/api/tools
     ports:
-      - "8080:8080"
+      - "8180:8080"  # Host 8180 -> Container 8080 (8080 often reserved by Windows/Hyper-V)
     volumes:
       - c:/docker-data/open-webui/data:/app/backend/data
     deploy:

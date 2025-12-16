@@ -33,6 +33,10 @@ def embed_messages(messages: List[dict]) -> list[float]:
     text_parts = []
     
     for msg in messages:
+        # Handle both Pydantic models and plain dicts
+        if hasattr(msg, 'model_dump'):
+            msg = msg.model_dump()
+        
         if isinstance(msg, dict):
             role = msg.get("role", "")
             content = msg.get("content", "")

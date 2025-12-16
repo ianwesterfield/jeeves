@@ -26,11 +26,15 @@ class Prompt(BaseModel):
 async def classify(p: Prompt):
     """
     Input:  { "text": "<raw user prompt>" }
-    Output: { "is_save_request": true|false }
+    Output: { "is_save_request": true|false, "confidence": float }
+    
+    Only returns is_save_request=True when confidence is high.
+    Defaults to NOT saving when uncertain (conservative approach).
     """
     start = time.time()
     try:
-        res = {"is_save_request": _is_save_request(p.text)}
+        is_save, confidence = _is_save_request(p.text)
+        res = {"is_save_request": is_save, "confidence": round(confidence, 4)}
         duration_ms = int((time.time() - start) * 1000)
         logger.debug("Classify result=%s duration_ms=%d text=%s", res, duration_ms, p.text[:200])
         return res

@@ -22,11 +22,17 @@ model.to(device)
 model.eval()
 
 
-def _is_save_request(text: str) -> bool:
+# Confidence threshold: only save when model is confident it's a save request
+# Default to NOT saving when uncertain (conservative approach)
+SAVE_CONFIDENCE_THRESHOLD = float(os.getenv("SAVE_CONFIDENCE_THRESHOLD", "0.70"))
+
+
+def _is_save_request(text: str) -> tuple[bool, float]:
     """
-    Returns True when the classifier predicts the class "remember".
+    Returns (is_save, confidence) tuple.
+    Only returns is_save=True when confidence exceeds threshold.
     Labels:
-        0 -> other
+        0 -> other (recall, query, casual)
         1 -> remember/save
     """
     short = text if len(text) <= 200 else text[:197] + "..."
@@ -45,7 +51,16 @@ def _is_save_request(text: str) -> bool:
         logits = model(**inputs).logits
         probs = F.softmax(logits, dim=-1).cpu().tolist()[0]
 
-    pred = int(torch.argmax(logits, dim=-1).cpu().item())
-    logger.debug("Prediction: %s (probs=%s)", pred, [round(p, 4) for p in probs])
-    return pred == 1
+    # probs[0] = probability of "other", probs[1] = probability of "save"
+    save_prob = probs[1]
+    
+    # Only classify as save request if confidence exceeds threshold
+    # Default to NOT saving when uncertain
+    is_save = save_prob >= SAVE_CONFIDENCE_THRESHOLD
+    
+    logger.debug(
+        "Prediction: save_prob=%.4f threshold=%.2f is_save=%s (probs=%s)",
+        save_prob, SAVE_CONFIDENCE_THRESHOLD, is_save, [round(p, 4) for p in probs]
+    )
+    return is_save, save_prob
 

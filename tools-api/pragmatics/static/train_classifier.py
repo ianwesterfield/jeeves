@@ -1,13 +1,21 @@
 # pragmatics/train_classifier.py
+"""
+Train a classifier to distinguish:
+  - Class 0: NOT a save request (recall queries, casual chat, general questions)
+  - Class 1: IS a save request (user providing info to remember)
+
+Key insight: "Do you remember my name?" is a RECALL (class 0), not a save.
+             "My name is John" is a SAVE (class 1).
+"""
 import torch
 from pathlib import Path
-from datasets import load_dataset
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
+import random
 
 # -----------------------------------------------------------------
-# 🚀 GPU Detection
+# GPU Detection
 # -----------------------------------------------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -16,133 +24,68 @@ if torch.cuda.is_available():
     print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
 
 # -----------------------------------------------------------------
-# 1️⃣ Load a real dataset from Hugging Face
+# Create training data with proper class separation
 # -----------------------------------------------------------------
-# Using the "silicone" dataset which has dialogue acts
-# You can also use "swda" (Switchboard) or create your own
-print("Loading dataset from Hugging Face...")
-# Option 1: Use silicone with trust_remote_code (legacy loader)
-# dataset = load_dataset("silicone", "dyda_da", split="train[:2000]", trust_remote_code=True)
+print("Creating training dataset...")
 
-# Option 2: Use emotion dataset and augment with memory-save examples
-from datasets import Dataset
-import random
+# Import examples from separate files
+from examples import SAVE_EXAMPLES, RECALL_EXAMPLES, CASUAL_EXAMPLES
 
-# Load emotion dataset for diversity
-emotion_data = load_dataset("dair-ai/emotion", split="train")
+# Combine all examples with proper labels
+# Class 0 = NOT save (recall + casual)
+# Class 1 = SAVE
+texts = []
+labels = []
 
-# Create synthetic memory-save examples (class 1)
-save_examples = [
-    # Original list:
-    "Remember my name is Sarah",
-    "Can you save that my birthday is May 3rd",
-    "Please remember I live in Seattle",
-    "Don't forget my email is john@example.com",
-    "Keep in mind I prefer vegetarian options",
-    "Note that I work at Microsoft",
-    "Remember my phone number is 555-1234",
-    "Save the fact that I have two cats",
-    "Please keep track of my appointment on Tuesday",
-    "Can you remember my wife's name is Emma",
-    "Store this: my favorite color is blue",
-    "Remember I'm allergic to peanuts",
-    "Keep this in mind: I speak Spanish fluently",
-    "Note down that my anniversary is June 15",
-    "Save that I drive a Tesla Model 3",
-    "Remember my doctor's appointment is at 3pm",
-    "Can you keep track that I'm training for a marathon",
-    "Please remember my son goes to Lincoln Elementary",
-    "Don't forget I need to call the bank tomorrow",
-    "Keep in mind my meeting with Sarah next Monday",
-    
-    # Colloquial variations:
-    "Hey, can you just save this: my name's Sarah?",
-    "Save that my birthday is May 3rd, yeah?",
-    "Please don't forget I live in Seattle, okay?",
-    "Got an email address? Mine's john@example.com",
-    "Just remember I'm a veggie lover, dude!",
-    "Note down my phone number: it's 555-1234",
-    "Save the fact that I've got two fur babies at home",
-    "Keep track of my appointment on Tuesday, okay?",
-    "Can you just remember my wife's name is Emma?",
-    "Store this: my favorite color is blue, bro!",
-    "Remember I'm super allergic to peanuts, man!",
-    "Just keep in mind that I speak Spanish fluently, bro",
-    "Save the date: my anniversary is June 15th",
-    "Hey, just remember I drive a Tesla Model 3",
-    "Got an appointment with my doctor at 3pm?",
-    "Can you just keep track that I'm training for a marathon?",
-    "Please don't forget I need to call the bank tomorrow, okay?",
-    "Just keep in mind I've got a meeting with Sarah next Monday",
-    
-    # Vague directives:
-    "Save this stuff for me",
-    "Remember, like, everything about me",
-    "Keep track of my schedule or something",
-    "Note down whatever's important, thanks",
-    "Save the essentials, man",
-    "Just remember, uh, details are important too",
-    "Save the date and time for my appointment",
-    "Keep in mind I'm running a marathon soon",
-    "Remember to call the bank tomorrow",
-    "Save the fact that I've got two cats at home",
-    
-    # Idiomatic expressions:
-    "Save that I'm a total bookworm, dude!",
-    "Remember I'm allergic to peanuts, big time!",
-    "Note down my favorite color: it's blue, no question!",
-    "Save the fact that I speak Spanish like a native",
-    "Remember I'm training for a marathon, every step counts!",
-    
-    # Dialects:
-    "Yo, save this: my birthday's on May 3rd, word?",
-    "Hey, can you just keep track that I'm from Seattle, G?" 
-    "Save the fact that I'm allergic to peanuts, for real",
-    
-    # Tone and style variations:
-    "Remember, it's really important to me",
-    "Just save this: my favorite color is blue",
-    "Keep in mind I've got a meeting with Sarah next Monday, yeah?",
-    "Save the date and time for my appointment, man",
-    "Don't forget, like, everything about me, okay?"
-    
-    # More examples that avoid direct references to saving or memorizing information:
-    "Just so you know, my name's Sarah",
-    "I've got a lot going on this week, can you help me get organized?",
-    "My wife's name is Emma, just FYI",
-    "If I don't call the bank tomorrow, it'll be a mess!",
-    "Got any free time? I need to schedule an appointment",
-    "I'm trying to remember everything for my marathon training",
-    "Can you help me set reminders for my upcoming meetings?",
-    "My favorite color is blue, but I also love purple",
-    "Just a heads up, my phone number's 555-1234",
-    "If you could keep this under your hat, that'd be great",
-    "Save the date: my anniversary is June 15th (don't forget to get me a gift)",
-    "I'm trying to remember everything about my cat, Luna",
-    "Keep in mind I've got two fur babies at home (they're adorable)",
-    "If you could help me keep track of my schedule, that'd be awesome",
-    "Just so you know, I work at Microsoft",
-    "My doctor's appointment is at 3pm tomorrow, don't forget to remind me",
-    "I'm training for a marathon and need all the support I can get"
-] * 25  # Replicate to balance dataset
+# Add save examples (class 1)
+for ex in SAVE_EXAMPLES:
+    texts.append(ex)
+    labels.append(1)
 
-# Create labels: emotion examples are class 0 (other), save examples are class 1 (remember)
-texts = [ex["text"] for ex in emotion_data] + save_examples
-labels = [0] * len(emotion_data) + [1] * len(save_examples)
+# Add recall examples (class 0) - KEY differentiators
+for ex in RECALL_EXAMPLES:
+    texts.append(ex)
+    labels.append(0)
 
-# Shuffle together
+# Add casual examples (class 0)
+for ex in CASUAL_EXAMPLES:
+    texts.append(ex)
+    labels.append(0)
+
+# Balance the dataset
+save_count = labels.count(1)
+other_count = labels.count(0)
+print(f"Before balancing: {save_count} save, {other_count} other")
+
+# Replicate minority class to balance
+if save_count < other_count:
+    factor = (other_count // save_count)
+    original_save = [(t, l) for t, l in zip(texts, labels) if l == 1]
+    for _ in range(factor - 1):
+        for t, l in original_save:
+            texts.append(t)
+            labels.append(l)
+elif other_count < save_count:
+    factor = (save_count // other_count)
+    original_other = [(t, l) for t, l in zip(texts, labels) if l == 0]
+    for _ in range(factor - 1):
+        for t, l in original_other:
+            texts.append(t)
+            labels.append(l)
+
+# Shuffle
 combined = list(zip(texts, labels))
+random.seed(42)
 random.shuffle(combined)
 texts, labels = zip(*combined)
-
-# Create dataset (already have texts and labels from above)
 texts = list(texts)
 labels = list(labels)
-print(f"Created dataset with {len(texts)} examples")
-print(f"Class distribution: {labels.count(0)} other, {labels.count(1)} remember")
+
+print(f"After balancing: {labels.count(1)} save, {labels.count(0)} other")
+print(f"Total dataset size: {len(texts)}")
 
 # -----------------------------------------------------------------
-# 2️⃣ Tokenizer & train/val split
+# Tokenizer & train/val split
 # -----------------------------------------------------------------
 tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
 
@@ -193,7 +136,7 @@ val_dataset = MemDataset({"input_ids": val_encodings["input_ids"],
                           val_labels)
 
 # -----------------------------------------------------------------
-# 3️⃣ Fine-tune DistilBERT
+# Fine-tune DistilBERT
 # -----------------------------------------------------------------
 print("Initializing model...")
 model = AutoModelForSequenceClassification.from_pretrained(
@@ -236,7 +179,7 @@ trainer = Trainer(
 trainer.train()
 
 # -----------------------------------------------------------------
-# 4️⃣ Save the checkpoint
+# Save the checkpoint
 # -----------------------------------------------------------------
 save_path = Path(".")
 model.save_pretrained(save_path / "distilbert_memory")
@@ -244,15 +187,31 @@ tokenizer.save_pretrained(save_path / "distilbert_memory")
 
 print(f"✅ Model saved to {save_path / 'distilbert_memory'}")
 
-# Test it
+# Test it with various examples
 def test_model(text):
     inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=128).to(device)
-    model.eval()  # Ensure eval mode
+    model.eval()
     with torch.no_grad():
         logits = model(**inputs).logits
+        probs = torch.softmax(logits, dim=-1)
     pred = torch.argmax(logits, dim=-1).item()
-    return "Remember" if pred == 1 else "Other"
+    conf = probs[0][pred].item()
+    label = "SAVE" if pred == 1 else "OTHER"
+    return f"{label} ({conf:.2%})"
 
 print("\n--- Quick test ---")
-print(f"'Remember my birthday is May 3rd' -> {test_model('Remember my birthday is May 3rd')}")
-print(f"'What's the weather today?' -> {test_model('What is the weather today?')}")
+print("SAVE requests (should be SAVE):")
+print(f"  'My name is John' -> {test_model('My name is John')}")
+print(f"  'Remember my birthday is May 3rd' -> {test_model('Remember my birthday is May 3rd')}")
+print(f"  'I work at Microsoft' -> {test_model('I work at Microsoft')}")
+
+print("\nRECALL queries (should be OTHER):")
+print(f"  'What is my name?' -> {test_model('What is my name?')}")
+print(f"  'Do you remember my birthday?' -> {test_model('Do you remember my birthday?')}")
+test_email = "What's my email?"
+print(f"  '{test_email}' -> {test_model(test_email)}")
+
+print("\nCasual chat (should be OTHER):")
+print(f"  'How are you?' -> {test_model('How are you?')}")
+print(f"  'What is the weather today?' -> {test_model('What is the weather today?')}")
+print(f"  'Tell me a joke' -> {test_model('Tell me a joke')}")
