@@ -5,10 +5,10 @@ import json
 import hashlib
 import requests
 from fastapi import APIRouter, HTTPException
-from app.services.qdrant_client import _client, _ensure_collection
-from app.services.embedder import embed_messages, embed
-from app.services.summarizer import summarize
-from app.utils.schemas import SaveRequest, SearchRequest, MemoryResult
+from services.qdrant_client import _client, _ensure_collection
+from services.embedder import embed_messages, embed
+from services.summarizer import summarize
+from utils.schemas import SaveRequest, SearchRequest, MemoryResult
 from qdrant_client.http import models
 
 router = APIRouter()

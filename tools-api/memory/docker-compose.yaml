@@ -34,11 +34,6 @@ services:
     networks:
       - webtools_network
 
-  # ---------------------------------------------------------
-  # Pragmatics service (tiny FastAPI)
-  # ---------------------------------------------------------
-  # Pragmatics service is now composed from the top-level docker/docker-compose.yaml
-
 networks:
   webtools_network:
     external: true

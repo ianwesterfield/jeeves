@@ -64,7 +64,7 @@ class Filter:
                 "metadata": metadata,
             }
             print(f"[filter] POST {url}")
-            response = requests.post(url, json=payload, timeout=10)
+            response = requests.post(url, json=payload, timeout=60)
             print(f"[filter] memory_api response status: {response.status_code}")
             response.raise_for_status()
             

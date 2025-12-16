@@ -4,11 +4,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import PlainTextResponse
 from pathlib import Path
-from app.api import memory
+from api import memory
 
 print("[main] Starting OpenWebUI Memory Service...")
 
 app = FastAPI(title="OpenWebUI Memory Service", version="1.0")
+
+@app.on_event("startup")
+async def preload_models():
+    """Pre-warm embedding model on startup to avoid first-request timeout."""
+    print("[main] Preloading embedding model...")
+    from services.embedder import embed
+    embed("warmup")  # Trigger model load
+    print("[main] Embedding model loaded and ready.")
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
