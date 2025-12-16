@@ -1,0 +1,41 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Model training checkpoints (large, not needed at runtime)
+**/checkpoint-*/
+**/distilbert_memory_output/
+
+# Tests
+tests/
+*_test.py
+test_*.py
+
+# Documentation
+*.md
+docs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

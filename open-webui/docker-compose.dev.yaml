@@ -1,0 +1,43 @@
+# -------------------------------------------------
+# Open‑WebUI – chat UI + user auth + RAG orchestration
+# -------------------------------------------------
+open-webui:
+  image: ghcr.io/open-webui/open-webui:latest
+  container_name: open-webui
+  depends_on:
+    - ollama
+  environment:
+    - USER_AGENT=WesterfieldCloud-OpenWebUI/1.0
+    - GLOBAL_LOG_LEVEL=DEBUG
+
+    - OLLAMA_BASE_URL=http://ollama:11434
+
+    - WEBUI_ADMIN_USERNAME=
+    - WEBUI_ADMIN_PASSWORD=
+
+    - RAG_EMBEDDING_ENGINE=ollama
+    - EMBEDDING_MODEL=BAAI/bge-large-en-v1.5
+    - MEMORY_ENABLED=true
+    - MEMORY_SHORT_TERM_MEMORY_DEPTH=15
+    - TOOLS_FUNCTION_CALLING_ENABLED=true
+    - TOOLS_FUNCTION_CALLING_LLMS=ollama
+    - MEMORY_API_URL=http://memory_api:8000
+    - TOOLS_DISCOVERY_URL=http://memory_api:8000/api/tools
+
+    # -----------------------------------------------------------
+  ports:
+    - "8080:8080"
+  volumes:
+    - c:/docker-data/open-webui/data:/app/backend/data
+  deploy:
+    resources:
+      limits:
+        cpus: "4"
+        memory: 8g
+  restart: unless-stopped
+  networks:
+    - webtools_network
+
+networks:
+  webtools_network:
+    external: true

@@ -1,0 +1,29 @@
+services:
+  # -------------------------------------------------
+  # Ollama – GPU‑accelerated inference
+  # -------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    runtime: nvidia
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    ports:
+      - "11434:11434"
+    volumes:
+      - C:\docker-data\ollama\.ollama:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    shm_size: 2g
+    restart: unless-stopped
+    networks:
+      - webtools_network
+
+networks:
+  webtools_network:
+    external: true

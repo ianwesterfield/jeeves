@@ -1,0 +1,8 @@
+fastapi
+huggingface_hub>=0.16          # any recent version is fine
+pydantic
+python-dotenv
+qdrant-client
+sentence_transformers>=2.5.0   # 2.5+ uses `hf_hub_download`
+transformers>=4.44             # local summarization pipeline
+uvicorn[standard]

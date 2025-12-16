@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+*.manifest
+*.spec
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
+logs/
+
+# training checkpoints
+**/checkpoint-*/
+**/distilbert_memory_output/
+**/distilbert_memory/**
+
+# Docker
+docker-compose.override.yml
+
+# Secrets
+*.pem
+*.key
+.env.local
+.env.*.local

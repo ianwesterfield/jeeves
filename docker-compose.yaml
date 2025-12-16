@@ -1,0 +1,123 @@
+networks:
+  webtools_network:
+    external: true
+
+services:
+  # -------------------------------------------------
+  # Ollama (GPU)
+  # -------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    runtime: nvidia
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    ports:
+      - "11434:11434"
+    volumes:
+      - C:\\docker-data\\ollama\\.ollama:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    shm_size: 2g
+    restart: unless-stopped
+    networks:
+      - webtools_network
+
+  # -------------------------------------------------
+  # Qdrant (vector DB)
+  # -------------------------------------------------
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    environment:
+      - QDRANT_LOG_LEVEL=DEBUG
+      - VECTOR_DIM=768
+    ports:
+      - "5100:5100"
+      - "6333:6333"
+    volumes:
+      - C:/docker-data/qdrant/storage:/qdrant/storage
+    restart: unless-stopped
+    networks:
+      - webtools_network
+
+  # -------------------------------------------------
+  # Memory API (tools-api memory service)
+  # -------------------------------------------------
+  memory_api:
+    build:
+      context: ./tools-api
+      dockerfile: memory/Dockerfile
+    container_name: memory_api
+    environment:
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - INDEX_NAME=user_memory_collection
+      - EMBEDDING_PROVIDER=sentence_transformers
+      - SUMMARY_MODEL=sshleifer/distilbart-cnn-12-6
+      - SUMMARY_DEVICE=cpu
+    ports:
+      - "8000:8000"
+    depends_on:
+      - qdrant
+    restart: unless-stopped
+    networks:
+      - webtools_network
+
+  # -------------------------------------------------
+  # Pragmatics service (classifier)
+  # -------------------------------------------------
+  pragmatics_api:
+    build:
+      context: ./tools-api/pragmatics
+      dockerfile: Dockerfile
+    container_name: pragmatics_api
+    environment:
+      - CLASSIFIER_MODEL=distilbert_memory
+    depends_on:
+      - memory_api
+    restart: unless-stopped
+    networks:
+      - webtools_network
+
+  # -------------------------------------------------
+  # Open-WebUI (UI + orchestration)
+  # -------------------------------------------------
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:latest
+    container_name: open-webui
+    depends_on:
+      - ollama
+    environment:
+      - USER_AGENT=WesterfieldCloud-OpenWebUI/1.0
+      - GLOBAL_LOG_LEVEL=DEBUG
+      - OLLAMA_BASE_URL=http://ollama:11434
+
+      - WEBUI_ADMIN_USERNAME=
+      - WEBUI_ADMIN_PASSWORD=
+
+      - RAG_EMBEDDING_ENGINE=ollama
+      - EMBEDDING_MODEL=BAAI/bge-large-en-v1.5
+      - MEMORY_ENABLED=true
+      - MEMORY_SHORT_TERM_MEMORY_DEPTH=15
+      - TOOLS_FUNCTION_CALLING_ENABLED=true
+      - TOOLS_FUNCTION_CALLING_LLMS=ollama
+      - MEMORY_API_URL=http://memory_api:8000
+      - TOOLS_DISCOVERY_URL=http://memory_api:8000/api/tools
+    ports:
+      - "8080:8080"
+    volumes:
+      - c:/docker-data/open-webui/data:/app/backend/data
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 8g
+    restart: unless-stopped
+    networks:
+      - webtools_network
