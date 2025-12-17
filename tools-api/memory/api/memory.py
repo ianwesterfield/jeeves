@@ -1,21 +1,20 @@
 """
 Memory API Router
 
-FastAPI router implementing the core memory service endpoints:
-- /save: Store conversations with semantic embeddings and extracted facts
-- /search: Retrieve relevant memories via semantic similarity
-- /summaries: Get summarized memory entries for a user
+Core endpoints for my memory service:
+- /save: Store conversations with embeddings and extracted facts
+- /search: Find relevant memories via semantic similarity
+- /summaries: Get memory summaries for a user
 
-The save endpoint implements a "search-first" pattern:
-1. Generate embedding from conversation
+The save endpoint does a "search-first" pattern:
+1. Generate embedding from the conversation
 2. Search for similar existing memories
 3. Extract structured facts (names, dates, preferences, etc.)
-4. Use pragmatics classifier to decide if worth saving
+4. Ask my pragmatics classifier if it's worth saving
 5. Store with both original text and extracted facts
-6. Return any found context for injection into the conversation
+6. Return any found context so the filter can inject it
 
-This allows the system to both recall relevant context AND learn new information
-in a single API call, minimizing latency for the Open-WebUI filter.
+This way I can recall context AND learn new info in one API call.
 """
 
 import os
@@ -39,13 +38,11 @@ from qdrant_client.http import models
 router = APIRouter(tags=["memory"])
 collection_name = os.getenv("INDEX_NAME", "user_memory_collection")
 
-# Pragmatics service endpoint for save/skip classification
+# Pragmatics classifier endpoint
 PRAGMATICS_HOST = os.getenv("PRAGMATICS_HOST", "pragmatics_api")
 PRAGMATICS_PORT = os.getenv("PRAGMATICS_PORT", "8001")
 
-# Keywords that indicate document/reference material being shared (should always save)
-# These phrases indicate PROVIDING content, not asking about it.
-# Used as a heuristic fallback when the ML classifier might miss document uploads.
+# Phrases that indicate someone is sharing a document (always save these)
 DOCUMENT_SHARE_PHRASES = [
     "please parse", "here's my", "here is my", "this is my", "store this",
     "keep this", "save this", "remember this document", "for future reference",
@@ -55,30 +52,17 @@ DOCUMENT_SHARE_PHRASES = [
 
 def _has_document_intent(text: str) -> bool:
     """
-    Detect if the message indicates document/reference material sharing.
-    
-    This heuristic fallback helps catch document uploads that the ML classifier
-    might miss. It looks for explicit sharing phrases and long-form content.
-    
-    Args:
-        text: The user message text to analyze.
-        
-    Returns:
-        True if the message appears to be sharing a document/reference,
-        False if it looks like a question or casual message.
-        
-    Note:
-        Questions are explicitly excluded to avoid saving recall requests.
-        Long messages (>500 chars) without question marks are assumed to be documents.
+    Check if the message looks like someone sharing a document.
+    This is a fallback heuristic for when my classifier misses doc uploads.
     """
     text_lower = text.lower().strip()
     
-    # Exclude questions - they're recalls, not saves
+    # Skip questions - those are recalls, not saves
     if text_lower.startswith(("do you", "can you", "what is", "what's", "where is", 
                               "how do", "have you", "did you", "does ", "is there",
                               "are there", "could you", "would you", "will you")):
         return False
-    if "?" in text_lower[:100]:  # Question mark early in text suggests a question
+    if "?" in text_lower[:100]:
         return False
     
     # Check for sharing phrases
@@ -86,7 +70,7 @@ def _has_document_intent(text: str) -> bool:
         if phrase in text_lower:
             return True
     
-    # Long messages (>500 chars) that don't look like questions are likely documents
+    # Long messages without questions are probably documents
     if len(text) > 500:
         return True
     
@@ -94,27 +78,16 @@ def _has_document_intent(text: str) -> bool:
 
 def _is_worth_saving(messages: list, extracted_facts: Optional[List[Dict]] = None) -> bool:
     """
-    Determine if a conversation is worth persisting to memory.
+    Decide if this conversation is worth saving.
     
-    Uses a multi-layer decision process:
-    1. If facts were extracted, always save (valuable structured data)
-    2. If document intent detected, always save (explicit sharing)
-    3. Call pragmatics classifier for ML-based decision
-    4. On any error, fail-open (save to avoid losing data)
-    
-    Args:
-        messages: List of conversation messages (dicts or Pydantic models).
-        extracted_facts: Pre-extracted facts from the text, if any.
-        
-    Returns:
-        True if the conversation should be saved, False otherwise.
-        
-    Note:
-        The pragmatics classifier is a DistilBERT model trained to distinguish
-        "save" intent ("My name is Ian") from "skip" intent ("What time is it?").
-        See pragmatics/ service for details.
+    My decision process:
+    1. If I extracted facts, save it (that's valuable structured data)
+    2. If it looks like a document share, save it
+    3. Ask my pragmatics classifier
+    4. If classifier confidence < 0.60, save anyway (fail-open when uncertain)
+    5. On any error, save anyway (don't lose data)
     """
-    # If we already extracted facts, definitely save
+    # If I extracted facts, definitely save
     if extracted_facts and len(extracted_facts) >= 1:
         print(f"[_is_worth_saving] Extracted {len(extracted_facts)} facts, forcing save")
         return True
@@ -161,23 +134,7 @@ def _is_worth_saving(messages: list, extracted_facts: Optional[List[Dict]] = Non
         return True
 
 def _get_text_content(content) -> str:
-    """
-    Extract plain text from message content.
-    
-    Handles both simple string content and multi-modal content arrays
-    (text + images) as used by providers like OpenAI.
-    
-    Args:
-        content: Either a string or a list of content items.
-                 List items should be dicts with "type" and "text" keys.
-    
-    Returns:
-        Concatenated text content, or empty string if no text found.
-    
-    Example:
-        >>> _get_text_content([{"type": "text", "text": "Hello"}, {"type": "image_url", ...}])
-        "Hello"
-    """
+    """Extract plain text from message content (handles strings and multi-modal arrays)."""
     if isinstance(content, str):
         return content
     elif isinstance(content, list):
@@ -192,58 +149,21 @@ def _get_text_content(content) -> str:
 
 def _make_uuid(user_id: str, content_hash: str) -> int:
     """
-    Generate a deterministic 64-bit integer ID for Qdrant storage.
-    
-    Uses UUID5 (SHA-1 based) to create a reproducible ID from user_id
-    and content hash. This ensures the same content always gets the
-    same ID, enabling upsert semantics (update if exists, insert if not).
-    
-    Args:
-        user_id: The user's unique identifier.
-        content_hash: Hash of the content being stored.
-    
-    Returns:
-        A 64-bit signed integer suitable for Qdrant point IDs.
-    
-    Note:
-        Qdrant requires integer IDs. We use modulo to stay within
-        the 64-bit signed integer range.
+    Generate a deterministic ID for Qdrant from user_id + content hash.
+    Same content always gets same ID, so upserts work correctly.
     """
     name = f"{user_id}:{content_hash}"
     uuid_obj = uuid.uuid5(uuid.NAMESPACE_DNS, name)
-    
-    # Convert to integer, keeping within 64-bit signed range
-    return int(uuid_obj.int) % (2**63)
+    return int(uuid_obj.int) % (2**63)  # Keep within 64-bit signed range
 
 @router.post("/save", status_code=200)
 def save_memory(req: SaveRequest) -> Dict[str, Any]:
     """
-    Save a conversation to memory with semantic embedding.
+    Save a conversation to memory.
     
-    Implements a "search-first" pattern:
-    1. Generate embedding from conversation messages
-    2. Search Qdrant for similar existing memories
-    3. Extract structured facts (names, preferences, etc.)
-    4. Use pragmatics classifier to decide if worth saving
-    5. If worth saving, upsert to Qdrant with facts
-    6. Return any found context for injection
-    
-    Args:
-        req: SaveRequest containing:
-            - user_id: User identifier for scoping
-            - messages: Conversation messages to process
-            - model: Optional LLM model identifier
-            - source_type: Optional source type (document, prompt, url, image)
-            - source_name: Optional source name (filename, URL, snippet)
-    
-    Returns:
-        Dict with:
-            - status: "saved", "saved_with_context", "context_found", or "skipped"
-            - reason: Human-readable explanation
-            - existing_context: List of relevant memories (if found)
-    
-    Raises:
-        HTTPException: On storage or embedding errors.
+    Does search-first: looks for similar memories, extracts facts, 
+    asks my classifier if it is worth saving, then stores it.
+    Returns any found context so the filter can inject it.
     """
     print(f"[/save] Received request: user_id={req.user_id}, messages={len(req.messages)}, model={req.model}")
     
@@ -422,26 +342,7 @@ def save_memory(req: SaveRequest) -> Dict[str, Any]:
 def search_memory(req: SearchRequest) -> List[MemoryResult]:
     """
     Search for relevant memories by semantic similarity.
-    
-    Generates an embedding from the query text and searches Qdrant
-    for similar stored memories, filtered by user_id.
-    
-    Args:
-        req: SearchRequest containing:
-            - user_id: User identifier for scoping
-            - query_text: Natural language search query
-            - top_k: Maximum number of results (1-20)
-    
-    Returns:
-        List of MemoryResult objects with:
-            - user_text: The stored message text or extracted facts
-            - score: Similarity score (0-1, higher is more similar)
-            - source_type: Content source type
-            - source_name: Human-readable source identifier
-    
-    Note:
-        Results are filtered by user_id using Qdrant payload filters.
-        A score threshold of 0.05 is applied to filter out irrelevant results.
+    Embeds the query, searches Qdrant, returns matches filtered by user_id.
     """
     print(f"[/search] Received request: user_id={req.user_id}, query_text={req.query_text[:60]}..., top_k={req.top_k}")
     query_vec = embed(req.query_text)
@@ -493,30 +394,8 @@ def search_memory(req: SearchRequest) -> List[MemoryResult]:
 @router.post("/summaries")
 def list_summaries(req: SearchRequest) -> List[Dict[str, Any]]:
     """
-    Return memory summaries matching a query for a user.
-    
-    Similar to search, but returns only summary text rather than
-    full memory content. Useful for getting a quick overview of
-    stored information without loading full documents.
-    
-    Args:
-        req: SearchRequest containing:
-            - user_id: User identifier for scoping
-            - query_text: Search query (defaults to general terms if empty)
-            - top_k: Maximum number of summaries (1-20)
-    
-    Returns:
-        List of dicts with:
-            - summary: The summarized memory text
-            - score: Similarity score (0-1)
-    
-    Raises:
-        HTTPException 404: If no summaries found for the user.
-        HTTPException 500: On search errors.
-    
-    Note:
-        If query_text is empty, searches using general terms like
-        "personal facts dates names preferences" to get diverse results.
+    Get memory summaries matching a query.
+    Like search but returns just the summary text, not full content.
     """
     print(f"[/summaries] Received request: user_id={req.user_id}, query_text={req.query_text}, top_k={req.top_k}")
     query = req.query_text or "personal facts dates names preferences"

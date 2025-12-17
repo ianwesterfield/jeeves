@@ -1,38 +1,21 @@
 """
-Open-WebUI Memory Filter Plugin
+Open-WebUI Memory Filter
 
-This filter integrates with Open-WebUI to provide semantic memory capabilities.
-It intercepts all conversations, sends them to the memory API for storage and
-retrieval, then injects any relevant context back into the conversation.
+This is my filter plugin for Open-WebUI. It intercepts every conversation,
+sends it to my memory API for storage and retrieval, then injects any
+relevant context back in before the model sees it.
 
-Workflow:
-    1. User sends message to Open-WebUI
-    2. inlet() intercepts the request
-    3. Extracts any file attachments and reads their content
-    4. Sends to memory API (/api/memory/save) for:
-       - Semantic search for related memories
-       - Fact extraction (names, preferences, etc.)
-       - Storage if deemed worth saving by pragmatics classifier
-    5. If context found, injects it into the conversation
-    6. Returns modified body to Open-WebUI
-    7. Model responds with full context available
+The flow:
+  1. User sends message
+  2. inlet() grabs it
+  3. Reads any attached files
+  4. Hits /api/memory/save for search + storage
+  5. If we found context, inject it
+  6. Return modified body to Open-WebUI
 
-Status Icons:
-    ✨ (U+2728)  - Processing/searching memory
-    🧠 (U+1F9E0) - Qdrant access (found/saved)
-    📄 (U+1F4C4) - Document source
-    💬 (U+1F4AC) - Prompt/conversation source
-    ⏭ (U+23ED)  - Skipped (not worth saving)
-    ⚠ (U+26A0)  - Error occurred
-
-Configuration:
-    The filter connects to memory_api:8000 (docker network hostname).
-    No additional configuration required.
-
-Attributes:
-    title: Memory Service Tools
-    version: 0.3
-    author: open-webui
+Status icons:
+  ✨ - Searching  🧠 - Found/saved  📄 - Doc source  💬 - Prompt source
+  ⏭ - Skipped    ⚠ - Error
 """
 
 from pydantic import BaseModel, Field
@@ -43,24 +26,8 @@ import os
 
 def _extract_file_contents(body: dict) -> tuple:
     """
-    Extract file contents from Open-WebUI's file attachments.
-    
-    Open-WebUI stores uploaded files on disk and passes file metadata
-    in the request body. This function reads the actual file content.
-    
-    Args:
-        body: The Open-WebUI request body containing a "files" array.
-              Each file entry has structure:
-              {"type": "file", "file": {"path": "/app/.../file.txt", "filename": "doc.txt"}}
-    
-    Returns:
-        tuple: (content_string, list_of_filenames)
-            - content_string: All file contents concatenated with headers
-            - list_of_filenames: Names of successfully read files
-    
-    Note:
-        Files that cannot be read (missing, binary, etc.) are silently skipped.
-        Content is prefixed with "[Document: filename]" for context.
+    Read file contents from Open-WebUI's uploads. Returns (content_string, filenames).
+    Files that can't be read are silently skipped.
     """
     file_contents = []
     filenames = []
@@ -90,27 +57,41 @@ def _extract_file_contents(body: dict) -> tuple:
     return "\n\n".join(file_contents), filenames
 
 
+def _format_single_source(ctx: dict) -> str:
+    """
+    Format a single memory source for its own status line.
+    Returns something like: 📄 runbook.md  or  💬 "My name is Ian..."
+    """
+    source_type = ctx.get("source_type")
+    source_name = ctx.get("source_name")
+    
+    if source_type == "document" and source_name:
+        return f"\U0001F4C4 {source_name}"  # 📄
+    elif source_type == "url" and source_name:
+        display_url = source_name[:50] + "..." if len(source_name) > 50 else source_name
+        return f"\U0001F517 {display_url}"  # 🔗
+    elif source_type == "image":
+        return f"\U0001F5BC {source_name or 'image'}"  # 🖼
+    elif source_type == "prompt" and source_name:
+        snippet = source_name[:60].replace("\n", " ")
+        if len(source_name) > 60:
+            snippet += "..."
+        return f"\U0001F4AC \"{snippet}\""  # 💬
+    else:
+        # Fallback: show user_text
+        user_text = ctx.get("user_text", "")
+        if user_text:
+            snippet = user_text[:60].replace("\n", " ")
+            if len(user_text) > 60:
+                snippet += "..."
+            return f"\U0001F4AC \"{snippet}\""  # 💬
+        return "\U0001F4DD memory"  # 📝
+
+
 def _format_source_description(context_items: list) -> str:
     """
-    Format source descriptions for UI status display.
-    
-    Creates a human-readable summary of where retrieved memories came from,
-    using icons and truncated identifiers.
-    
-    Args:
-        context_items: List of memory context dicts with source_type,
-                       source_name, and user_text fields.
-    
-    Returns:
-        A formatted string like:
-        "📄 runbook.md | 💬 'My name is Ian...'"
-        
-    Icons:
-        📄 - Document (PDF, markdown, text file)
-        🔗 - URL/link
-        🖼 - Image
-        💬 - Conversation/prompt
-        📝 - Generic memory
+    Format sources for UI status display. Uses icons:
+      📄 doc | 🔗 url | 🖼 image | 💬 prompt | 📝 memory
     """
     sources = []
     for ctx in context_items[:3]:  # Limit to first 3 for brevity
@@ -151,55 +132,24 @@ def _format_source_description(context_items: list) -> str:
 
 class Filter:
     """
-    Open-WebUI Filter for Memory Service Integration.
-    
-    This class implements the Open-WebUI filter interface with inlet/outlet methods.
-    It intercepts conversations, communicates with the memory API, and injects
-    retrieved context back into the conversation flow.
-    
-    Attributes:
-        valves: Configuration valves (unused, but required by interface).
-        toggle: Whether the filter is enabled (always True).
-        icon: Base64-encoded SVG icon for the UI.
-    
-    Methods:
-        inlet: Process incoming messages before model inference.
-        outlet: Process after model response (currently no-op).
-        _inject_context: Insert retrieved memories into conversation.
+    My Open-WebUI filter. Implements inlet/outlet to intercept conversations
+    and talk to the memory API.
     """
     
     class Valves(BaseModel):
-        """Filter configuration (currently unused)."""
+        """Config valves (unused for now)."""
         pass
 
     def __init__(self):
-        """Initialize the filter with default settings."""
+        """Set up defaults."""
         self.valves = self.Valves()
         self.toggle = True
         self.icon = """data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIGZpbGw9Im5vbmUiIHZpZXdCb3g9IjAgMCAyNCAyNCIgc3Ryb2tlLXdpZHRoPSIxLjUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBjbGFzcz0ic2l6ZS02Ij4KICAKICA8cGF0aCBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGQ9Ik0xMiAxOHYtNS4yNW0wIDBhNi4wMSA2LjAxIDAgMCAwIDEuNS0uMTg5bS0xLjUuMTg5YTYuMDEgNi4wMSAwIDAgMS0xLjUtLjE4OW0zLjc1IDcuNDc4YTEyLjA2IDEyLjA2IDAgMCAxLTQuNSAwbTMuNzUgMi4zODNhMTQuNDA2IDE0LjQwNiAwIDAgMS0zIDBNMTQuMjUgMTh2LS4xOTJjMC0uOTgzLjY1OC0xLjgyMyAxLjUwOC0yLjMxNmE3LjUgNy41IDAgMSAwLTcuNTE3IDBjLjg1LjQ5MyAxLjUwOSAxLjMzMyAxLjUwOSAyLjMxNlYxOCIgLz4KPC9zdmc+Cg=="""
 
     def _inject_context(self, body: dict, existing_context: list) -> dict:
         """
-        Inject retrieved memory context into the conversation.
-        
-        Prepends context as a formatted block before the last user message.
-        This makes the relevant memories available to the model without
-        modifying the visible conversation history.
-        
-        Args:
-            body: The Open-WebUI request body with "messages" array.
-            existing_context: List of memory dicts with "user_text" fields.
-        
-        Returns:
-            Modified body with context injected, or original body if no context.
-        
-        Format:
-            ### Relevant information from previous conversations ###
-            - [memory 1]
-            - [memory 2]
-            ### End of context ###
-            
-            [original user message]
+        Inject retrieved memories into the conversation. Prepends a context block
+        before the last user message so the model can see it.
         """
         print(f"[filter] _inject_context called with {len(existing_context) if existing_context else 0} items")
         
@@ -249,30 +199,9 @@ class Filter:
 
     async def inlet(self, body: dict, __event_emitter__, __user__: Optional[dict] = None) -> dict:
         """
-        Process incoming messages before model inference.
-        
-        This is the main entry point for the filter. It:
-        1. Extracts user ID and messages from the request
-        2. Reads any attached file contents from disk
-        3. Sends to memory API for search and storage
-        4. Injects found context back into the conversation
-        5. Emits status updates for the UI
-        
-        Args:
-            body: The Open-WebUI request body containing:
-                  - messages: List of conversation messages
-                  - model: The LLM model ID
-                  - metadata: Additional request metadata
-                  - files: Optional file attachments
-            __event_emitter__: Async function to emit status updates to UI.
-            __user__: Optional user info dict with "id" field.
-        
-        Returns:
-            Modified body with injected context, or original on error.
-        
-        Note:
-            Errors are caught and logged, but never block the conversation.
-            On error, the original body is returned unchanged.
+        Main entry point. Grabs the conversation, reads any attached files,
+        hits the memory API, and injects context if we found any. Errors are
+        caught and logged but never block the conversation.
         """
         try:
             print("[filter] inlet called")
@@ -371,12 +300,34 @@ class Filter:
             
             # Update status based on what happened
             if status == "saved_with_context":
-                source_desc = _format_source_description(existing_context)
+                # Emit one status line per memory found
                 await __event_emitter__(
                     {
                         "type": "status",
                         "data": {
-                            "description": f"\U0001F9E0 Saved + Found {len(existing_context)}: {source_desc}",  # 🧠
+                            "description": f"\U0001F9E0 Saved + Found {len(existing_context)} memories:",  # 🧠
+                            "done": False,
+                            "hidden": False,
+                        },
+                    }
+                )
+                for ctx in existing_context:
+                    desc = _format_single_source(ctx)
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": f"  \u2022 {desc}",
+                                "done": False,
+                                "hidden": False,
+                            },
+                        }
+                    )
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": "\u2714 Context injected",  # ✔
                             "done": True,
                             "hidden": False,
                         },
@@ -386,12 +337,34 @@ class Filter:
                 body = self._inject_context(body, existing_context)
                 
             elif status == "context_found":
-                source_desc = _format_source_description(existing_context)
+                # Emit one status line per memory found
                 await __event_emitter__(
                     {
                         "type": "status",
                         "data": {
-                            "description": f"\U0001F9E0 Found {len(existing_context)}: {source_desc}",  # 🧠
+                            "description": f"\U0001F9E0 Found {len(existing_context)} memories:",  # 🧠
+                            "done": False,
+                            "hidden": False,
+                        },
+                    }
+                )
+                for ctx in existing_context:
+                    desc = _format_single_source(ctx)
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": f"  \u2022 {desc}",
+                                "done": False,
+                                "hidden": False,
+                            },
+                        }
+                    )
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": "\u2714 Context injected",  # ✔
                             "done": True,
                             "hidden": False,
                         },
@@ -452,17 +425,5 @@ class Filter:
             return body
 
     async def outlet(self, body: dict, __event_emitter__, __user__: Optional[dict] = None) -> None:
-        """
-        Process after model response (outlet filter).
-        
-        Currently a no-op. Could be extended to:
-        - Save assistant responses to memory
-        - Extract facts from model output
-        - Update conversation summaries
-        
-        Args:
-            body: The response body from the model.
-            __event_emitter__: Async function to emit status updates.
-            __user__: Optional user info dict.
-        """
+        """Post-response hook. Currently a no-op but could save assistant responses later."""
         pass

@@ -1,33 +1,26 @@
 """
-OpenWebUI Memory Service - Main Application Entry Point
+Jeeves Memory Service - Main Entry Point
 
-This FastAPI application provides a semantic memory layer for Open-WebUI conversations.
-It captures user messages, extracts structured facts, generates embeddings, and stores
-them in Qdrant for later retrieval via semantic search.
+This is my semantic memory layer for Open-WebUI. It captures conversations,
+extracts facts, generates embeddings, and stores everything in Qdrant so I 
+can recall relevant context later.
 
-Architecture:
-    - FastAPI app with CORS middleware for Open-WebUI integration
-    - Qdrant vector database for semantic storage and retrieval
+Stack:
+    - FastAPI with CORS for Open-WebUI integration
+    - Qdrant vector DB for semantic storage
     - SentenceTransformers (all-mpnet-base-v2) for 768-dim embeddings
     - Pattern-based fact extraction for structured data
-    - Pragmatics classifier for save/skip decisions
+    - My pragmatics classifier to decide what's worth saving
 
 Endpoints:
-    POST /api/memory/save    - Save conversation with semantic embedding
-    POST /api/memory/search  - Search memories by query text
-    POST /api/memory/summaries - Get memory summaries for a user
-    GET  /api/memory/filter  - Serve filter plugin source for Open-WebUI
-    GET  /.well-known/*      - Static plugin manifest files
+    POST /api/memory/save      - Save a conversation
+    POST /api/memory/search    - Search memories
+    POST /api/memory/summaries - Get memory summaries
+    GET  /api/memory/filter    - Serve the filter plugin for Open-WebUI
+    GET  /.well-known/*        - Static plugin manifest files
 
-Environment Variables:
-    QDRANT_HOST      - Qdrant server hostname (default: localhost)
-    QDRANT_PORT      - Qdrant server port (default: 6333)
-    INDEX_NAME       - Collection name (default: user_memory_collection)
-    PRAGMATICS_HOST  - Pragmatics classifier host (default: pragmatics_api)
-    PRAGMATICS_PORT  - Pragmatics classifier port (default: 8001)
-
-Usage:
-    uvicorn main:app --host 0.0.0.0 --port 8000
+Env vars:
+    QDRANT_HOST, QDRANT_PORT, INDEX_NAME, PRAGMATICS_HOST, PRAGMATICS_PORT
 """
 
 import inspect
@@ -49,41 +42,22 @@ app = FastAPI(
 
 @app.on_event("startup")
 async def preload_models() -> None:
-    """
-    Pre-warm the embedding model on startup.
-    
-    This prevents timeout on the first real request by loading the
-    SentenceTransformer model into memory before any API calls.
-    """
+    """Load the embedding model at startup so the first request isn't slow."""
     print("[main] Preloading embedding model...")
     from services.embedder import embed
-    embed("warmup")  # Trigger model load
+    embed("warmup")
     print("[main] Embedding model loaded and ready.")
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """
-    HTTP middleware for request/response logging.
-    
-    Logs all incoming requests and their response status codes
-    for debugging and monitoring purposes.
-    
-    Args:
-        request: The incoming HTTP request.
-        call_next: The next middleware/handler in the chain.
-        
-    Returns:
-        The HTTP response from downstream handlers.
-    """
+    """Simple request/response logging for debugging."""
     print(f"[main] Incoming request: {request.method} {request.url.path}")
     response = await call_next(request)
     print(f"[main] Response status: {response.status_code}")
     return response
 
 
-# CORS Configuration
-# These origins are allowed to make cross-origin requests to the API.
-# Add additional origins as needed for your deployment.
+# CORS - allowing my local dev origins
 origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
@@ -100,15 +74,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Static Files
-# Serve plugin manifest files (ai-plugin.json, openapi.yaml) under /.well-known
-# These are required for Open-WebUI to discover and integrate the memory service.
+# Plugin manifest files for Open-WebUI discovery
 static_dir = Path(__file__).resolve().parent / "static"
 print(f"[main] Mounting static files from {static_dir}")
 app.mount("/.well-known", StaticFiles(directory=str(static_dir)), name="static")
 
-# API Router
-# The memory router handles /save, /search, and /summaries endpoints.
+# Memory API routes
 print("[main] Including memory router at /api/memory")
 app.include_router(memory.router, prefix="/api/memory")
 
@@ -116,18 +87,8 @@ app.include_router(memory.router, prefix="/api/memory")
 @app.get("/api/memory/filter", response_class=PlainTextResponse)
 def get_memory_filter() -> str:
     """
-    Serve the memory filter plugin source code for Open-WebUI.
-    
-    Open-WebUI parses this Python source to discover the Filter class
-    and its inlet/outlet methods. The filter intercepts conversations,
-    sends them to the memory API, and injects retrieved context.
-    
-    Returns:
-        str: The complete source code of memory.filter.py as plain text.
-        
-    Note:
-        This endpoint is called by Open-WebUI when loading filters.
-        The returned code must be valid Python with a Filter class.
+    Serve the filter plugin source for Open-WebUI.
+    Open-WebUI parses this to find the Filter class and wire it up.
     """
     print("[main] GET /api/memory/filter called")
     functions_module_path = Path(__file__).resolve().parent / "memory.filter.py"

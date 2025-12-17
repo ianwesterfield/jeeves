@@ -1,22 +1,14 @@
 """
-Text Summarization Service
+Summarizer
 
-Provides text summarization using multiple backends with automatic fallback:
-1. Local transformers pipeline (preferred, no API key needed)
-2. HuggingFace Inference API (requires HF_TOKEN)
-3. Heuristic fallback (simple sentence extraction)
+Generates summaries of stored memories. Tries local transformers first (no
+network), then HuggingFace Inference API if I have HF_TOKEN, then falls back
+to just grabbing the first couple sentences.
 
-The summarizer is used to create concise summaries of stored memories
-for display in the UI and for creating more focused embeddings.
-
-Environment Variables:
-    SUMMARY_MODEL: Model ID for summarization (default: sshleifer/distilbart-cnn-12-6)
-    SUMMARY_DEVICE: Device for local inference - "cpu" or GPU index (default: cpu)
-    HF_TOKEN: HuggingFace API token for Inference API (optional)
-
-Usage:
-    from services.summarizer import summarize
-    summary = summarize("Long text here...", max_words=60)
+Env vars:
+  - SUMMARY_MODEL (default: sshleifer/distilbart-cnn-12-6)
+  - SUMMARY_DEVICE ("cpu" or GPU index)
+  - HF_TOKEN (optional, for HF Inference API)
 """
 
 import os
@@ -28,13 +20,7 @@ _pipeline = None
 
 
 def _init_backends() -> None:
-    """
-    Initialize summarization backends lazily.
-    
-    Attempts to initialize both the local transformers pipeline and
-    the HuggingFace Inference API client. Either or both may fail
-    gracefully if dependencies or credentials are missing.
-    """
+    """Lazy init for summarization backends. Sets up local pipeline and/or HF client."""
     global _hf_client, _pipeline
     if _hf_client is None:
         try:
@@ -57,24 +43,9 @@ def _init_backends() -> None:
 
 def summarize(text: str, max_words: int = 60) -> str:
     """
-    Generate a concise summary of the input text.
-    
-    Tries multiple backends in order of preference:
-    1. Local transformers pipeline (fastest, no network)
-    2. HuggingFace Inference API (better quality, requires token)
-    3. Heuristic fallback (first 2 sentences, trimmed)
-    
-    Args:
-        text: The text to summarize. Can be any length.
-        max_words: Target maximum words in output (approximate).
-        
-    Returns:
-        A summarized version of the input text, or empty string if input is empty.
-        
-    Example:
-        >>> summarize("My name is Ian. I work at Satcom Direct. I live in Florida.")
-        "Personal info: Ian, works at Satcom Direct, lives in Florida."
-    "
+    Summarize text. Tries local pipeline first, then HF API, then just grabs
+    the first couple sentences if all else fails.
+    """
     print(f"[summarizer] summarize() called, text length={len(text or '')}, max_words={max_words}")
     text = (text or "").strip()
     if not text:

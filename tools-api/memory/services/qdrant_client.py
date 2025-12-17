@@ -1,24 +1,17 @@
 """
-Qdrant Client Service
+Qdrant Client
 
-Provides a singleton Qdrant client and collection management utilities.
-The client lazily connects on first use and maintains a persistent connection.
+My singleton client for Qdrant. Connects lazily on first use and keeps
+the connection alive. The collection is 768-dim COSINE (matches my
+all-mpnet-base-v2 embeddings).
 
-Collection Schema:
-    - Vectors: 768 dimensions (all-mpnet-base-v2 embeddings)
-    - Distance: COSINE similarity
-    - Payload fields:
-        - user_id: str (indexed for filtering)
-        - user_text: str (original message text)
-        - facts: list[dict] (extracted structured facts)
-        - facts_text: str (formatted facts for display)
-        - source_type: str ("document", "prompt", "url", "image")
-        - source_name: str (filename, URL, or text snippet)
+Payload fields I store:
+  - user_id, user_text, facts, facts_text, source_type, source_name
 
-Environment Variables:
-    QDRANT_HOST: Qdrant server hostname (default: localhost)
-    QDRANT_PORT: Qdrant server port (default: 6333)
-    INDEX_NAME: Collection name (default: user_memory_collection)
+Env vars:
+  - QDRANT_HOST (default: localhost)
+  - QDRANT_PORT (default: 6333)
+  - INDEX_NAME (default: user_memory_collection)
 """
 
 import os
@@ -29,18 +22,7 @@ _client_instance: QdrantClient | None = None
 
 
 def _client() -> QdrantClient:
-    """
-    Get the singleton Qdrant client instance.
-    
-    Creates and caches a connection on first call. Subsequent calls
-    return the cached client. Thread-safe for read operations.
-    
-    Returns:
-        QdrantClient: Connected Qdrant client instance.
-        
-    Raises:
-        ConnectionError: If unable to connect to Qdrant server.
-    """
+    """Get the singleton Qdrant client. Creates and caches the connection on first call."""
     global _client_instance
     if _client_instance is None:
         host = os.getenv("QDRANT_HOST", "localhost")
@@ -52,18 +34,9 @@ def _client() -> QdrantClient:
 
 def _ensure_collection() -> None:
     """
-    Ensure the memory collection exists in Qdrant.
-    
-    Checks if the collection exists and creates it if not. Existing collections
-    are used as-is without modification to prevent data loss.
-    
-    The collection is configured for:
-    - 768-dimensional vectors (all-mpnet-base-v2 output)
-    - COSINE distance metric (normalized embeddings)
-    
-    Note:
-        This function is idempotent and safe to call multiple times.
-        It will NOT recreate or modify existing collections.
+    Make sure the collection exists. Creates it if missing, but leaves
+    existing collections alone to avoid data loss. Idempotent and safe to
+    call repeatedly.
     """
     collection_name = os.getenv("INDEX_NAME", "user_memory_collection")
     print(f"[qdrant_client] _ensure_collection() for '{collection_name}'")
@@ -80,16 +53,7 @@ def _ensure_collection() -> None:
 
 
 def _create_collection(client: QdrantClient, collection_name: str) -> None:
-    """
-    Create a new Qdrant collection with the required schema.
-    
-    Args:
-        client: The Qdrant client instance.
-        collection_name: Name for the new collection.
-        
-    Raises:
-        Exception: If collection creation fails.
-    """
+    """Create a new collection with 768-dim COSINE vectors."""
     try:
         client.recreate_collection(
             collection_name=collection_name,

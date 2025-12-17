@@ -1,40 +1,17 @@
 """
-Fact Extractor Service
+Fact Extractor
 
-Extracts structured facts from conversational text and documents.
-Converts natural language into typed key-value pairs for storage and retrieval.
-
-Examples:
-    "My name is Ian"          → {"type": "user_first_name", "value": "Ian"}
-    "I work at Satcom Direct" → {"type": "employer", "value": "Satcom Direct"}
-    "VLAN 40 is for IoT"      → {"type": "vlan_40", "value": "IoT"}
-
-Supported Fact Types:
-    - Personal: user_first_name, user_last_name, user_name
-    - Family: family_daughter, family_son, family_wife, etc.
-    - Professional: employer, job_title
-    - Contact: email, phone
-    - Location: location, address
-    - Dates: birthday
-    - Preferences: favorite_color, favorite_food, preference
-    - Technical: vlan_*, ip_address, subnet, domain
-    - Document: table_* (from markdown tables), kv_* (key-value pairs)
-
-Usage:
-    from services.fact_extractor import extract_facts, extract_facts_from_document
-    
-    # For short messages
-    facts = extract_facts("My name is Ian and I work at Satcom Direct")
-    
-    # For longer documents (runbooks, etc.)
-    facts = extract_facts_from_document(document_text)
+Pulls structured facts out of conversational text via regex. Things like
+"My name is Ian" become {type: user_first_name, value: Ian}. Handles
+personal info, family, work, contact, dates, preferences, and tech stuff
+(VLANs, IPs, domains). Also parses markdown tables and key: value lines
+for runbook-style docs.
 """
 
 import re
 from typing import List, Dict, Optional
 
-# Pattern definitions for common fact types
-# Each pattern has: (regex, fact_type, group_index_for_value)
+# My fact patterns: (regex, fact_type, group_index_for_value)
 FACT_PATTERNS = [
     # Names - MUST have possessive/intro to avoid matching things like "Name resolution"
     (r"(?:my )(first name|name) (?:is |'s |= )?([A-Z][a-z]+)", "user_first_name", 2),
@@ -76,7 +53,7 @@ FACT_PATTERNS = [
     (r"([A-Za-z0-9.-]+\.(?:cloud|local|lan|home|internal)) ", "domain", 1),
 ]
 
-# Document section headers that indicate structured content
+# Headers that usually mean structured content is coming
 SECTION_PATTERNS = [
     (r"^#+\s*(.+)$", "section"),  # Markdown headers
     (r"^\*\*(.+)\*\*:?\s*$", "section"),  # Bold headers
@@ -86,29 +63,8 @@ SECTION_PATTERNS = [
 
 def extract_facts(text: str) -> List[Dict[str, str]]:
     """
-    Extract structured facts from conversational text.
-    
-    Applies regex patterns to identify and extract personal information,
-    preferences, and technical details from natural language.
-    
-    Args:
-        text: The text to extract facts from.
-        
-    Returns:
-        List of fact dictionaries, each with:
-        - "type": The fact category (e.g., "user_first_name", "employer")
-        - "value": The extracted value
-        
-    Example:
-        >>> extract_facts("My name is Ian and I work at Satcom Direct")
-        [
-            {"type": "user_first_name", "value": "Ian"},
-            {"type": "employer", "value": "Satcom Direct"},
-        ]
-        
-    Note:
-        Patterns are case-insensitive. Duplicate facts are deduplicated
-        by (type, lowercase_value) pairs.
+    Run my regex patterns over the text and pull out facts.
+    Returns list of {type, value} dicts. Dedupes automatically.
     """
     if not text:
         return []
@@ -148,10 +104,7 @@ def extract_facts(text: str) -> List[Dict[str, str]]:
 
 
 def extract_facts_from_document(text: str) -> List[Dict[str, str]]:
-    """
-    Extract facts from a longer document (like a runbook).
-    Handles structured content like tables, lists, and sections.
-    """
+    """For longer docs (runbooks, etc.)—gets pattern-based facts plus tables and key:value lines."""
     facts = []
     
     # First get pattern-based facts
@@ -178,7 +131,7 @@ def extract_facts_from_document(text: str) -> List[Dict[str, str]]:
 
 
 def _extract_from_tables(text: str) -> List[Dict[str, str]]:
-    """Extract facts from markdown tables."""
+    """Pull facts from markdown tables. First row = headers, rest = data."""
     facts = []
     
     # Find markdown tables (lines with |)
@@ -213,7 +166,7 @@ def _extract_from_tables(text: str) -> List[Dict[str, str]]:
 
 
 def _extract_key_value_pairs(text: str) -> List[Dict[str, str]]:
-    """Extract key: value pairs from text."""
+    """Grab Key: Value or Key = Value lines. Skips URLs and long values."""
     facts = []
     
     # Pattern for "Key: Value" or "Key = Value"
@@ -234,14 +187,7 @@ def _extract_key_value_pairs(text: str) -> List[Dict[str, str]]:
 
 
 def format_facts_for_storage(facts: List[Dict[str, str]]) -> str:
-    """
-    Format extracted facts as a structured string for storage.
-    
-    Output format:
-    user_first_name: Ian
-    employer: Satcom Direct
-    vlan_40: IoT
-    """
+    """Turn facts into a readable string for storage (one per line, type: value)."""
     if not facts:
         return ""
     
@@ -253,10 +199,7 @@ def format_facts_for_storage(facts: List[Dict[str, str]]) -> str:
 
 
 def facts_to_embedding_text(facts: List[Dict[str, str]], original_text: str = "") -> str:
-    """
-    Create text optimized for semantic embedding from facts.
-    Combines structured facts with key phrases from original text.
-    """
+    """Build text optimized for embedding—facts in readable form plus context snippet."""
     parts = []
     
     # Add formatted facts
