@@ -205,7 +205,6 @@ def save_memory(req: SaveRequest) -> Dict[str, Any]:
     Returns any found context so the filter can inject it.
     """
     _ensure_collection()
-    vector = embed_messages(req.messages)
     
     # Extract the last user message for storage (full content + text)
     user_content = None
@@ -216,6 +215,16 @@ def save_memory(req: SaveRequest) -> Dict[str, Any]:
             user_content = msg_dict.get("content", "")
             user_text = _get_text_content(user_content)
             break
+    
+    # For SEARCH: embed only the last user message (not full conversation)
+    # This prevents prior context from polluting search results
+    if user_text:
+        search_vector = embed_messages([{"role": "user", "content": user_text}])
+    else:
+        search_vector = embed_messages(req.messages)
+    
+    # For STORAGE: embed the full conversation for richer context
+    storage_vector = embed_messages(req.messages)
     
     if not user_text:
         user_text = "[empty message]"
@@ -244,7 +253,7 @@ def save_memory(req: SaveRequest) -> Dict[str, Any]:
         search_response = session.post(
             f"http://{qdrant_host}:{qdrant_port}/collections/{collection_name}/points/search",
             json={
-                "vector": vector,
+                "vector": search_vector,  # Use search_vector (last user message only) for retrieval
                 "filter": {
                     "must": [
                         {
@@ -253,8 +262,8 @@ def save_memory(req: SaveRequest) -> Dict[str, Any]:
                         }
                     ]
                 },
-                "limit": 3,
-                "score_threshold": 0.70,  # Require strong similarity to avoid irrelevant context
+                "limit": 5,  # Get more results to find relevant docs
+                "score_threshold": 0.45,  # Lower threshold to catch document chunks
                 "with_payload": True,
             },
             timeout=5
@@ -262,6 +271,19 @@ def save_memory(req: SaveRequest) -> Dict[str, Any]:
         search_response.raise_for_status()
         search_data = search_response.json()
         search_results = search_data.get("result", []) if "result" in search_data else []
+        
+        # Apply score gap filter: if there's a big drop between top result and others,
+        # only keep the highly relevant ones (prevents "wife's name" when asking "my name")
+        if len(search_results) > 1:
+            top_score = search_results[0].get("score", 0)
+            filtered_results = [search_results[0]]  # Always keep top result
+            for pt in search_results[1:]:
+                pt_score = pt.get("score", 0)
+                # Keep if within 15% of top score (relative gap)
+                # OR if absolute score is very high (>0.7)
+                if pt_score >= top_score * 0.85 or pt_score > 0.7:
+                    filtered_results.append(pt)
+            search_results = filtered_results
         
         # Store context if found
         if search_results:
@@ -301,7 +323,12 @@ def save_memory(req: SaveRequest) -> Dict[str, Any]:
         pass  # Search failure is non-fatal
     
     # Check if this conversation is worth saving via pragmatics classifier
-    worth_saving, classifier_error = _is_worth_saving(req.messages)
+    # Skip classifier for document chunks (always save those)
+    if req.skip_classifier:
+        worth_saving = True
+        classifier_error = ""
+    else:
+        worth_saving, classifier_error = _is_worth_saving(req.messages)
     
     if classifier_error:
         # Classifier is down - report the error
@@ -349,7 +376,7 @@ def save_memory(req: SaveRequest) -> Dict[str, Any]:
         payload["source_name"] = req.source_name
     
     point_id = _make_uuid(req.user_id, content_hash)
-    point = models.PointStruct(id=point_id, vector=vector, payload=payload)
+    point = models.PointStruct(id=point_id, vector=storage_vector, payload=payload)  # Use storage_vector (full convo) for storage
     client.upsert(collection_name=collection_name, points=[point])
     
     # Single consolidated log
