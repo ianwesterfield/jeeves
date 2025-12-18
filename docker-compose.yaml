@@ -89,6 +89,30 @@ services:
       - webtools_network
 
   # -------------------------------------------------
+  # Extractor API (Media -> Text)
+  # -------------------------------------------------
+  extractor_api:
+    build:
+      context: ./tools-api/extractor
+      dockerfile: Dockerfile
+    container_name: extractor_api
+    environment:
+      - WHISPER_MODEL=base
+    volumes:
+      # Cache models between restarts
+      - extractor_cache:/root/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    networks:
+      - webtools_network
+
+  # -------------------------------------------------
   # Open-WebUI
   # -------------------------------------------------
   open-webui:
@@ -127,4 +151,6 @@ services:
 
 volumes:
   qdrant_storage:
+    driver: local
+  extractor_cache:
     driver: local

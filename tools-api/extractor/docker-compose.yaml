@@ -1,0 +1,33 @@
+# Extractor Service - Media to Text Extraction
+# Part of the Jeeves memory system
+
+services:
+  extractor_api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: extractor_api
+    ports:
+      - "8002:8002"
+    environment:
+      - WHISPER_MODEL=base
+    volumes:
+      # Cache models between restarts
+      - extractor_cache:/root/.cache
+    networks:
+      - webtools_network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  extractor_cache:
+
+networks:
+  webtools_network:
+    external: true
