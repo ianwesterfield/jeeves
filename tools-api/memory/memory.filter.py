@@ -35,24 +35,19 @@ def _extract_file_contents(body: dict) -> tuple:
     
     for file_info in files:
         try:
-            # Open-WebUI structure: {'type': 'file', 'file': {..., 'path': '/app/backend/data/uploads/...'}}
             if isinstance(file_info, dict):
                 file_data = file_info.get("file", file_info)
                 file_path = file_data.get("path")
                 filename = file_data.get("filename", file_data.get("name", "unknown"))
                 
                 if file_path and os.path.exists(file_path):
-                    print(f"[filter] Reading file content from: {file_path}")
                     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                         content = f.read()
                     if content.strip():
                         file_contents.append(f"[Document: {filename}]\n{content}")
                         filenames.append(filename)
-                        print(f"[filter] Extracted {len(content)} chars from {filename}")
-                else:
-                    print(f"[filter] File path not found or missing: {file_path}")
-        except Exception as e:
-            print(f"[filter] Error reading file: {e}")
+        except Exception:
+            pass  # Skip unreadable files silently
     
     return "\n\n".join(file_contents), filenames
 
@@ -151,15 +146,8 @@ class Filter:
         Inject retrieved memories into the conversation. Prepends a context block
         before the last user message so the model can see it.
         """
-        print(f"[filter] _inject_context called with {len(existing_context) if existing_context else 0} items")
-        
         if not existing_context:
-            print("[filter] No existing_context, returning body unchanged")
             return body
-        
-        # Debug: print what we received
-        for i, ctx in enumerate(existing_context):
-            print(f"[filter] Context item {i}: {ctx}")
         
         # Build context string from retrieved memories
         context_parts = []
@@ -169,7 +157,6 @@ class Filter:
                 context_parts.append(f"- {user_text}")
         
         if not context_parts:
-            print("[filter] No context_parts extracted, returning body unchanged")
             return body
         
         context_block = (
@@ -177,7 +164,6 @@ class Filter:
             + "\n".join(context_parts)
             + "\n### End of context ###\n\n"
         )
-        print(f"[filter] Injecting context: {context_block[:200]}...")
         
         messages = body.get("messages", [])
         
@@ -185,13 +171,10 @@ class Filter:
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "user":
                 original_content = messages[i].get("content", "")
-                # Handle content that might be a list (multi-modal)
                 if isinstance(original_content, str):
                     messages[i]["content"] = context_block + original_content
                 elif isinstance(original_content, list):
-                    # For multi-modal, prepend as text item
                     messages[i]["content"] = [{"type": "text", "text": context_block}] + original_content
-                print(f"[filter] Injected into user message at index {i}")
                 break
         
         body["messages"] = messages
@@ -204,33 +187,10 @@ class Filter:
         caught and logged but never block the conversation.
         """
         try:
-            print("[filter] inlet called")
             user_id = __user__["id"] if __user__ and "id" in __user__ else "anonymous"
-            
-            # Extract messages array
             messages = body.get("messages", [])
             model = body.get("model", "unknown")
             metadata = body.get("metadata", {})
-            print(f"[filter] user_id={user_id}, model={model}, messages={len(messages)}")
-            
-            # Debug: Log full body structure to understand what Open-WebUI sends
-            import json
-            print(f"[filter] DEBUG body keys: {list(body.keys())}")
-            for i, msg in enumerate(messages):
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    print(f"[filter] msg[{i}] role={msg.get('role')} content_len={len(content)} preview={content[:100]}...")
-                elif isinstance(content, list):
-                    print(f"[filter] msg[{i}] role={msg.get('role')} content is list with {len(content)} items")
-                    for j, item in enumerate(content):
-                        if isinstance(item, dict):
-                            print(f"[filter]   item[{j}] type={item.get('type')} keys={list(item.keys())}")
-            
-            # Check for file attachments in metadata or elsewhere
-            if "files" in body:
-                print(f"[filter] DEBUG: body has 'files' key with {len(body['files'])} items")
-            if "files" in metadata:
-                print(f"[filter] DEBUG: metadata has 'files' key")
             
             # Extract file contents and append to messages
             file_content, filenames = _extract_file_contents(body)
@@ -238,28 +198,21 @@ class Filter:
             source_name = None
             
             if file_content:
-                print(f"[filter] Extracted file content ({len(file_content)} chars), adding to messages")
-                # Add file content as a supplementary user message
-                messages = messages.copy()  # Don't modify original
+                messages = messages.copy()
                 messages.append({
                     "role": "user",
                     "content": f"[Attached Document Content]\n{file_content}"
                 })
-                # Set source info for documents
                 source_type = "document"
                 source_name = filenames[0] if filenames else "attachment"
             else:
-                # For regular prompts, create a snippet as source_name
                 source_type = "prompt"
-                last_user_msg = None
                 for msg in reversed(messages):
                     if msg.get("role") == "user":
                         content = msg.get("content", "")
                         if isinstance(content, str):
-                            last_user_msg = content
+                            source_name = content[:50] + "..." if len(content) > 50 else content
                         break
-                if last_user_msg:
-                    source_name = last_user_msg[:50] + "..." if len(last_user_msg) > 50 else last_user_msg
             
             if not messages or not isinstance(messages, list):
                 raise ValueError("Body must contain 'messages' array")
@@ -285,18 +238,17 @@ class Filter:
                 "source_type": source_type,
                 "source_name": source_name,
             }
-            print(f"[filter] POST {url}")
             response = requests.post(url, json=payload, timeout=60)
-            print(f"[filter] memory_api response status: {response.status_code}")
             response.raise_for_status()
             
-            # Parse response to check for context
+            # Parse response
             result = response.json()
             status = result.get("status", "unknown")
             existing_context = result.get("existing_context")
-            reason = result.get("reason", "")
+            ctx_count = len(existing_context) if existing_context else 0
             
-            print(f"[filter] memory_api status={status}, context_items={len(existing_context) if existing_context else 0}")
+            # Single consolidated log line
+            print(f"[filter] inlet: user={user_id} msgs={len(messages)} files={len(filenames)} status={status} context={ctx_count}")
             
             # Update status based on what happened
             if status == "saved_with_context":

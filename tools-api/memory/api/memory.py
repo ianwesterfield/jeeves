@@ -18,20 +18,25 @@ This way I can recall context AND learn new info in one API call.
 """
 
 import os
+import time
 from typing import Dict, Any, Optional, List, Union
 import uuid
 import json
 import hashlib
 import requests
+import base64
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from fastapi import APIRouter, HTTPException
 from services.qdrant_client import _client, _ensure_collection
 from services.embedder import embed_messages, embed
-from services.fact_extractor import (
-    extract_facts,
-    extract_facts_from_document,
-    format_facts_for_storage,
-    facts_to_embedding_text,
-)
+# Fact extractor disabled for now - was causing false positives
+# from services.fact_extractor import (
+#     extract_facts,
+#     extract_facts_from_document,
+#     format_facts_for_storage,
+#     facts_to_embedding_text,
+# )
 from utils.schemas import SaveRequest, SearchRequest, MemoryResult
 from qdrant_client.http import models
 
@@ -42,56 +47,29 @@ collection_name = os.getenv("INDEX_NAME", "user_memory_collection")
 PRAGMATICS_HOST = os.getenv("PRAGMATICS_HOST", "pragmatics_api")
 PRAGMATICS_PORT = os.getenv("PRAGMATICS_PORT", "8001")
 
-# Phrases that indicate someone is sharing a document (always save these)
-DOCUMENT_SHARE_PHRASES = [
-    "please parse", "here's my", "here is my", "this is my", "store this",
-    "keep this", "save this", "remember this document", "for future reference",
-    "here's a document", "this document", "attached document", "below is",
-]
+# HTTP session with retry for Qdrant REST calls
+_http_session = None
 
+def _get_http_session() -> requests.Session:
+    """Get a requests session with automatic retry on connection errors."""
+    global _http_session
+    if _http_session is None:
+        _http_session = requests.Session()
+        retry = Retry(total=3, backoff_factor=1, status_forcelist=[502, 503, 504])
+        adapter = HTTPAdapter(max_retries=retry)
+        _http_session.mount("http://", adapter)
+        _http_session.mount("https://", adapter)
+    return _http_session
 
-def _has_document_intent(text: str) -> bool:
+def _is_worth_saving(messages: list) -> tuple[bool, str]:
     """
-    Check if the message looks like someone sharing a document.
-    This is a fallback heuristic for when my classifier misses doc uploads.
+    Ask the pragmatics classifier if this conversation is worth saving.
+    
+    Returns:
+        (should_save, error_message) - error_message is empty string if no error
+    
+    Raises no exceptions - returns (False, error) if classifier is unavailable.
     """
-    text_lower = text.lower().strip()
-    
-    # Skip questions - those are recalls, not saves
-    if text_lower.startswith(("do you", "can you", "what is", "what's", "where is", 
-                              "how do", "have you", "did you", "does ", "is there",
-                              "are there", "could you", "would you", "will you")):
-        return False
-    if "?" in text_lower[:100]:
-        return False
-    
-    # Check for sharing phrases
-    for phrase in DOCUMENT_SHARE_PHRASES:
-        if phrase in text_lower:
-            return True
-    
-    # Long messages without questions are probably documents
-    if len(text) > 500:
-        return True
-    
-    return False
-
-def _is_worth_saving(messages: list, extracted_facts: Optional[List[Dict]] = None) -> bool:
-    """
-    Decide if this conversation is worth saving.
-    
-    My decision process:
-    1. If I extracted facts, save it (that's valuable structured data)
-    2. If it looks like a document share, save it
-    3. Ask my pragmatics classifier
-    4. If classifier confidence < 0.60, save anyway (fail-open when uncertain)
-    5. On any error, save anyway (don't lose data)
-    """
-    # If I extracted facts, definitely save
-    if extracted_facts and len(extracted_facts) >= 1:
-        print(f"[_is_worth_saving] Extracted {len(extracted_facts)} facts, forcing save")
-        return True
-    
     # Extract the last user message to send to pragmatics
     user_text = None
     for msg in reversed(messages):
@@ -101,37 +79,26 @@ def _is_worth_saving(messages: list, extracted_facts: Optional[List[Dict]] = Non
             break
     
     if not user_text:
-        print("[_is_worth_saving] No user message found, defaulting to save")
-        return True
-    
-    # Heuristic check: document/reference sharing should always save
-    if _has_document_intent(user_text):
-        print(f"[_is_worth_saving] Document intent detected, forcing save")
-        return True
+        return True, ""
     
     try:
         resp = requests.post(
             f"http://{PRAGMATICS_HOST}:{PRAGMATICS_PORT}/api/pragmatic",
             json={"text": user_text},
-            timeout=3
+            timeout=5
         )
         resp.raise_for_status()
         result = resp.json()
-        is_save = result.get("is_save_request", True)
+        is_save = result.get("is_save_request", False)
         confidence = result.get("confidence", 0.0)
-        print(f"[_is_worth_saving] Pragmatics response: is_save_request={is_save}, confidence={confidence:.4f}")
-        
-        # Low confidence = uncertain, so fail-open to avoid losing important info
-        # If classifier isn't confident (< 0.60), default to save
-        if confidence < 0.60:
-            print(f"[_is_worth_saving] Low confidence ({confidence:.2f} < 0.60), defaulting to save")
-            return True
-        
-        return is_save
+        print(f"[memory] Classifier: is_save={is_save} confidence={confidence:.2f}")
+        return is_save, ""
+    except requests.exceptions.ConnectionError:
+        return False, "Pragmatics classifier unavailable"
+    except requests.exceptions.Timeout:
+        return False, "Pragmatics classifier timeout"
     except Exception as e:
-        # Fail open: if pragmatics is down, save anyway
-        print(f"[_is_worth_saving] Pragmatics call failed ({e}), defaulting to save")
-        return True
+        return False, f"Pragmatics error: {str(e)[:50]}"
 
 def _get_text_content(content) -> str:
     """Extract plain text from message content (handles strings and multi-modal arrays)."""
@@ -145,6 +112,78 @@ def _get_text_content(content) -> str:
                     text_parts.append(item.get("text", ""))
         return " ".join(text_parts)
     return ""
+
+
+def _serialize_full_content(content: Union[str, List[Dict[str, Any]]], max_size_mb: int = 100) -> Optional[str]:
+    """
+    Serialize full message content for storage, including multi-modal data.
+    Converts images to base64, checks total size limit.
+    
+    Returns JSON string of the content, or None if too large.
+    """
+    if isinstance(content, str):
+        # Plain text - check size
+        size_bytes = len(content.encode('utf-8'))
+        if size_bytes > max_size_mb * 1024 * 1024:
+            return None
+        return content
+    
+    elif isinstance(content, list):
+        serialized_items = []
+        total_size = 0
+        
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+                
+            item_type = item.get("type")
+            if item_type == "text":
+                text = item.get("text", "")
+                text_bytes = text.encode('utf-8')
+                total_size += len(text_bytes)
+                if total_size > max_size_mb * 1024 * 1024:
+                    return None
+                serialized_items.append({"type": "text", "text": text})
+                
+            elif item_type == "image_url":
+                # Convert image to base64
+                image_url = item.get("image_url", {})
+                if isinstance(image_url, dict):
+                    url = image_url.get("url", "")
+                else:
+                    url = str(image_url)
+                
+                try:
+                    # For now, assume data URLs or fetch if needed
+                    # In practice, Open-WebUI sends base64 data URLs
+                    if url.startswith("data:image/"):
+                        # Already base64, extract
+                        header, data = url.split(",", 1)
+                        image_bytes = base64.b64decode(data)
+                        total_size += len(image_bytes)
+                        if total_size > max_size_mb * 1024 * 1024:
+                            return None
+                        serialized_items.append({
+                            "type": "image_url",
+                            "image_url": {"url": url}  # Keep original
+                        })
+                    else:
+                        # External URL - could fetch, but for now skip or placeholder
+                        # To keep simple, just store the URL
+                        serialized_items.append({
+                            "type": "image_url", 
+                            "image_url": {"url": url}
+                        })
+                except Exception:
+                    # If conversion fails, skip this item
+                    continue
+        
+        if total_size > max_size_mb * 1024 * 1024:
+            return None
+            
+        return json.dumps(serialized_items)
+    
+    return None
 
 
 def _make_uuid(user_id: str, content_hash: str) -> int:
@@ -165,29 +204,33 @@ def save_memory(req: SaveRequest) -> Dict[str, Any]:
     asks my classifier if it is worth saving, then stores it.
     Returns any found context so the filter can inject it.
     """
-    print(f"[/save] Received request: user_id={req.user_id}, messages={len(req.messages)}, model={req.model}")
-    
-    # Ensure collection exists
-    print("[/save] Ensuring collection exists...")
     _ensure_collection()
-    
-    # Generate embedding from all messages
-    print("[/save] Generating embedding from messages...")
     vector = embed_messages(req.messages)
-    print(f"[/save] Embedding generated, dim={len(vector)}")
     
-    # Extract the last user message text for storage
+    # Extract the last user message for storage (full content + text)
+    user_content = None
     user_text = None
     for msg in reversed(req.messages):
         msg_dict = msg.model_dump() if hasattr(msg, 'model_dump') else msg
         if msg_dict.get("role") == "user":
-            user_text = _get_text_content(msg_dict.get("content", ""))
+            user_content = msg_dict.get("content", "")
+            user_text = _get_text_content(user_content)
             break
     
     if not user_text:
         user_text = "[empty message]"
     
-    print(f"[/save] User text: {user_text[:100]}..." if len(user_text) > 100 else f"[/save] User text: {user_text}")
+    # Serialize full content for storage (with size limit)
+    serialized_content = _serialize_full_content(user_content)
+    if serialized_content is None:
+        # Content too large, skip saving
+        return {
+            "status": "skipped",
+            "point_id": None,
+            "content_hash": None,
+            "existing_context": None,
+            "reason": "Content too large (>100MB)"
+        }
     
     # Always search for similar memories first (even if we might skip saving)
     client = _client()
@@ -196,8 +239,9 @@ def save_memory(req: SaveRequest) -> Dict[str, Any]:
     existing_context = None
     
     try:
-        # Use REST API directly for search
-        search_response = requests.post(
+        # Use REST API directly for search with retry
+        session = _get_http_session()
+        search_response = session.post(
             f"http://{qdrant_host}:{qdrant_port}/collections/{collection_name}/points/search",
             json={
                 "vector": vector,
@@ -209,8 +253,8 @@ def save_memory(req: SaveRequest) -> Dict[str, Any]:
                         }
                     ]
                 },
-                "limit": 10,  # Increased to capture more potential matches
-                "score_threshold": 0.05,  # Lowered to include document content
+                "limit": 3,
+                "score_threshold": 0.70,  # Require strong similarity to avoid irrelevant context
                 "with_payload": True,
             },
             timeout=5
@@ -219,50 +263,57 @@ def save_memory(req: SaveRequest) -> Dict[str, Any]:
         search_data = search_response.json()
         search_results = search_data.get("result", []) if "result" in search_data else []
         
-        print(f"Search for user {req.user_id}: found {len(search_results)} results")
-        
-        # Store context if found (we'll return it regardless of whether we save)
-        # Prefer facts_text over user_text for cleaner context injection
+        # Store context if found
         if search_results:
             existing_context = []
             for pt in search_results:
                 payload = pt.get("payload", {})
-                # Prefer structured facts if available, fall back to user_text
                 facts_text = payload.get("facts_text")
                 stored_text = payload.get("user_text", "")
+                full_content = payload.get("full_content")
+                
+                # Use full content if available, otherwise fall back to text
+                context_text = stored_text
+                if full_content:
+                    try:
+                        # If it's JSON array, extract text parts
+                        content_data = json.loads(full_content)
+                        if isinstance(content_data, list):
+                            text_parts = []
+                            for item in content_data:
+                                if item.get("type") == "text":
+                                    text_parts.append(item.get("text", ""))
+                            if text_parts:
+                                context_text = " ".join(text_parts)
+                    except:
+                        pass  # Fall back to stored_text
                 
                 existing_context.append({
-                    "user_text": facts_text if facts_text else stored_text,
-                    "facts": payload.get("facts"),  # Include raw facts for advanced use
+                    "user_text": facts_text if facts_text else context_text,
+                    "full_content": full_content,  # Include full content for multi-modal
+                    "facts": payload.get("facts"),
                     "score": pt.get("score", 0),
                     "source_type": payload.get("source_type", "prompt"),
                     "source_name": payload.get("source_name"),
                 })
-            
-            print(f"Context extracted: {len(existing_context)} items")
     
-    except Exception as e:
-        # If search fails, just continue
-        print(f"Search failed: {e}")
+    except Exception:
+        pass  # Search failure is non-fatal
     
-    # Extract structured facts from the text BEFORE checking if worth saving
-    # This allows us to save messages that contain valuable facts even if
-    # the pragmatics classifier thinks it's not a save request
-    is_document = len(user_text) > 500
-    if is_document:
-        facts = extract_facts_from_document(user_text)
-        print(f"[/save] Extracted {len(facts)} facts from document")
-    else:
-        facts = extract_facts(user_text)
-        print(f"[/save] Extracted {len(facts)} facts from message")
+    # Check if this conversation is worth saving via pragmatics classifier
+    worth_saving, classifier_error = _is_worth_saving(req.messages)
     
-    # Check if this conversation is worth saving (pass facts for override)
-    worth_saving = _is_worth_saving(req.messages, extracted_facts=facts)
-    
-    print(f"DEBUG: _is_worth_saving returned {worth_saving}")
+    if classifier_error:
+        # Classifier is down - report the error
+        return {
+            "status": "error",
+            "point_id": None,
+            "content_hash": None,
+            "existing_context": existing_context if existing_context else None,
+            "reason": classifier_error
+        }
     
     if not worth_saving:
-        print("Skipping save: conversation not worth saving (too trivial)")
     
         # Return context if found, even though we're not saving
         if existing_context:
@@ -282,24 +333,13 @@ def save_memory(req: SaveRequest) -> Dict[str, Any]:
         }
     
     # Always save the new memory (even if similar context was found)
-    content_hash = hashlib.md5(user_text.encode()).hexdigest()
+    content_hash = hashlib.md5(serialized_content.encode()).hexdigest()
     
-    # Format facts for storage
-    facts_text = format_facts_for_storage(facts)
-    
-    # Create embedding-optimized text
-    # For documents with facts, embed the facts for better semantic matching
-    # For short messages without facts, use original text
-    if facts:
-        embedding_text = facts_to_embedding_text(facts, user_text)
-        print(f"[/save] Using fact-based embedding: {embedding_text[:200]}..." if len(embedding_text) > 200 else f"[/save] Using fact-based embedding: {embedding_text}")
-        # Re-embed with fact-focused text
-        vector = embed(embedding_text)
-    
-    # Build payload with both original text and extracted facts
+    # Build payload with full content
     payload: Dict[str, Any] = {
         "user_id": req.user_id,
-        "user_text": user_text,
+        "user_text": user_text,  # Keep for compatibility/search
+        "full_content": serialized_content,  # New: full multi-modal content
     }
     
     # Add source information
@@ -308,21 +348,13 @@ def save_memory(req: SaveRequest) -> Dict[str, Any]:
     if req.source_name:
         payload["source_name"] = req.source_name
     
-    # Add facts if extracted
-    if facts:
-        payload["facts"] = facts
-        payload["facts_text"] = facts_text
-    
     point_id = _make_uuid(req.user_id, content_hash)
-    
-    point = models.PointStruct(
-        id=point_id,
-        vector=vector,
-        payload=payload,
-    )
-    print(f"[/save] Upserting point_id={point_id} to collection={collection_name}")
+    point = models.PointStruct(id=point_id, vector=vector, payload=payload)
     client.upsert(collection_name=collection_name, points=[point])
-    print(f"[/save] Upsert complete")
+    
+    # Single consolidated log
+    ctx_count = len(existing_context) if existing_context else 0
+    print(f"[/save] user={req.user_id} saved={True} context={ctx_count}")
     
     # Return status with both saved info and any context that was found
     result = {
@@ -344,14 +376,13 @@ def search_memory(req: SearchRequest) -> List[MemoryResult]:
     Search for relevant memories by semantic similarity.
     Embeds the query, searches Qdrant, returns matches filtered by user_id.
     """
-    print(f"[/search] Received request: user_id={req.user_id}, query_text={req.query_text[:60]}..., top_k={req.top_k}")
     query_vec = embed(req.query_text)
-    print(f"[/search] Query embedding generated, dim={len(query_vec)}")
     qdrant_host = os.getenv("QDRANT_HOST", "localhost")
     qdrant_port = os.getenv("QDRANT_PORT", "6333")
     
     try:
-        search_response = requests.post(
+        session = _get_http_session()
+        search_response = session.post(
             f"http://{qdrant_host}:{qdrant_port}/collections/{collection_name}/points/search",
             json={
                 "vector": query_vec,
@@ -372,16 +403,15 @@ def search_memory(req: SearchRequest) -> List[MemoryResult]:
         search_data = search_response.json()
         results = search_data.get("result", []) if "result" in search_data else []
         
-        print(f"[/search] Qdrant returned {len(results)} results")
-        
         if not results:
-            print("[/search] No memories found, returning 404")
             raise HTTPException(status_code=404, detail="No memories found")
+        
+        print(f"[/search] user={req.user_id} results={len(results)}")
         
         return [
             MemoryResult(
                 user_text=pt.get("payload", {}).get("user_text", ""),
-                messages=None,  # Deprecated
+                messages=None,
                 score=pt.get("score", 0)
             )
             for pt in results
@@ -397,15 +427,14 @@ def list_summaries(req: SearchRequest) -> List[Dict[str, Any]]:
     Get memory summaries matching a query.
     Like search but returns just the summary text, not full content.
     """
-    print(f"[/summaries] Received request: user_id={req.user_id}, query_text={req.query_text}, top_k={req.top_k}")
     query = req.query_text or "personal facts dates names preferences"
     query_vec = embed(query)
-    print(f"[/summaries] Query embedding generated, dim={len(query_vec)}")
     qdrant_host = os.getenv("QDRANT_HOST", "localhost")
     qdrant_port = os.getenv("QDRANT_PORT", "6333")
 
     try:
-        search_response = requests.post(
+        session = _get_http_session()
+        search_response = session.post(
             f"http://{qdrant_host}:{qdrant_port}/collections/{collection_name}/points/search",
             json={
                 "vector": query_vec,
@@ -417,23 +446,19 @@ def list_summaries(req: SearchRequest) -> List[Dict[str, Any]]:
                 "limit": req.top_k,
                 "with_payload": True,
             },
-            timeout=5,
+            timeout=10,
         )
         search_response.raise_for_status()
         data = search_response.json()
         results = data.get("result", [])
 
-        print(f"[/summaries] Qdrant returned {len(results)} results")
+        summaries = [
+            {"summary": pt.get("payload", {}).get("summary"), "score": pt.get("score", 0)}
+            for pt in results
+            if pt.get("payload", {}).get("summary")
+        ]
         
-        # Extract summaries only
-        summaries = []
-        for pt in results:
-            payload = pt.get("payload", {})
-            summary = payload.get("summary")
-            if summary:
-                summaries.append({"summary": summary, "score": pt.get("score", 0)})
-
-        print(f"[/summaries] Extracted {len(summaries)} summaries")
+        print(f"[/summaries] user={req.user_id} results={len(summaries)}")
         
         if not summaries:
             raise HTTPException(status_code=404, detail="No summaries found")

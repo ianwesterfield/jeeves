@@ -36,13 +36,16 @@ services:
     container_name: qdrant
     environment:
       - QDRANT_LOG_LEVEL=DEBUG
-      - VECTOR_DIM=768
+      # Flush WAL more frequently to reduce corruption risk on shutdown
+      - QDRANT__STORAGE__OPTIMIZERS__FLUSH_INTERVAL_SEC=1
     ports:
       - "5100:5100"
       - "6333:6333"
     volumes:
-      - C:/docker-data/qdrant/storage:/qdrant/storage
+      - qdrant_storage:/qdrant/storage
     restart: unless-stopped
+    # Give Qdrant time to flush WAL and close cleanly
+    stop_grace_period: 30s
     networks:
       - webtools_network
 
@@ -110,7 +113,7 @@ services:
       - MEMORY_API_URL=http://memory_api:8000
       - TOOLS_DISCOVERY_URL=http://memory_api:8000/api/tools
     ports:
-      - "8180:8080"  # Host 8180 -> Container 8080 (8080 often reserved by Windows/Hyper-V)
+      - "8180:8080" # Host 8180 -> Container 8080 (8080 often reserved by Windows/Hyper-V)
     volumes:
       - c:/docker-data/open-webui/data:/app/backend/data
     deploy:
@@ -121,3 +124,7 @@ services:
     restart: unless-stopped
     networks:
       - webtools_network
+
+volumes:
+  qdrant_storage:
+    driver: local

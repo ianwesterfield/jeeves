@@ -13,9 +13,9 @@ from typing import List, Dict, Optional
 
 # My fact patterns: (regex, fact_type, group_index_for_value)
 FACT_PATTERNS = [
-    # Names - MUST have possessive/intro to avoid matching things like "Name resolution"
-    (r"(?:my )(first name|name) (?:is |'s |= )?([A-Z][a-z]+)", "user_first_name", 2),
-    (r"(?:my )(last name|surname|family name) (?:is |'s |= )?([A-Z][a-z]+)", "user_last_name", 2),
+    # Names - MUST have possessive/intro AND a separator to avoid matching "my name again?"
+    (r"(?:my )(first name|name) (?:is |'s |= )([A-Z][a-z]+)", "user_first_name", 2),
+    (r"(?:my )(last name|surname|family name) (?:is |'s |= )([A-Z][a-z]+)", "user_last_name", 2),
     (r"(?:i'm |i am |my name is |call me )([A-Z][a-z]+(?: [A-Z][a-z]+)?)", "user_name", 1),
     
     # Nicknames/preferences for how to be addressed or refer to things
