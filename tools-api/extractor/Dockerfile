@@ -7,8 +7,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   git \
   && rm -rf /var/lib/apt/lists/*
 
-# Install Python packages
-RUN pip install --no-cache-dir \
+# Install Python packages (including bitsandbytes for 4-bit quantization)
+RUN pip install \
   "numpy<2" \
   fastapi \
   uvicorn[standard] \
@@ -20,6 +20,7 @@ RUN pip install --no-cache-dir \
   einops \
   timm \
   accelerate \
+  bitsandbytes \
   openai-whisper \
   Pillow \
   pymupdf \

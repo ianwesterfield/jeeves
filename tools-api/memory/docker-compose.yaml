@@ -1,12 +1,14 @@
+# Standalone Memory API + Qdrant
+# Use this for development/testing memory service in isolation
+
 services:
   qdrant:
     image: qdrant/qdrant:latest
     container_name: qdrant
     environment:
-      - QDRANT_LOG_LEVEL=DEBUG
-      - VECTOR_DIM=768
+      - QDRANT__LOG_LEVEL=DEBUG
     ports:
-      - "5100:5100" # UI
+      - "5100:5100" # Dashboard UI
       - "6333:6333" # HTTP API
     volumes:
       - C:/docker-data/qdrant/storage:/qdrant/storage
@@ -14,18 +16,21 @@ services:
     networks:
       - webtools_network
 
-  memory:
+  memory_api:
     build:
       context: ..
       dockerfile: memory/Dockerfile
-    container_name: memory
+    container_name: memory_api
     environment:
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
       - INDEX_NAME=user_memory_collection
       - EMBEDDING_PROVIDER=sentence_transformers
       - SUMMARY_MODEL=sshleifer/distilbart-cnn-12-6
-      - SUMMARY_DEVICE=cpu
+      - SUMMARY_DEVICE=cpu # Use cpu for summarizer (or 0 for GPU)
+      - HF_HOME=/models
+    volumes:
+      - C:/docker-data/models:/models
     ports:
       - "8000:8000"
     depends_on:

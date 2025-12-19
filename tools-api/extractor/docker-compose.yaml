@@ -11,9 +11,11 @@ services:
       - "8002:8002"
     environment:
       - WHISPER_MODEL=base
+      - IMAGE_MODEL=llava-4bit # Options: llava-4bit (~4GB VRAM), llava (~14GB), florence (~4GB)
+      - HF_HOME=/models # Use centralized model storage
     volumes:
-      # Cache models between restarts
-      - extractor_cache:/root/.cache
+      # Central model storage - shared across all containers
+      - C:/docker-data/models:/models
     networks:
       - webtools_network
     deploy:
@@ -24,9 +26,6 @@ services:
               count: 1
               capabilities: [gpu]
     restart: unless-stopped
-
-volumes:
-  extractor_cache:
 
 networks:
   webtools_network:

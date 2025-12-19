@@ -1,5 +1,21 @@
 # AI Coding Agent Instructions for this Repo
 
+## Command Execution Guidelines
+
+**For the user's workflow:**
+
+- ❌ Do NOT suggest Docker/compose rebuild commands in prose instructions
+- ✅ DO suggest PowerShell automations as runnable code blocks
+- ✅ DO suggest supporting commands (logs, status checks, etc.) as runnable code blocks
+- User handles all docker/build commands manually
+
+**Code block format for supporting commands:**
+
+```powershell
+docker logs extractor_api
+docker ps -a
+```
+
 ## Big Picture
 
 - **Purpose:** FastAPI microservice that captures conversation "memories", embeds them with `sentence-transformers`, and stores/searches them in **Qdrant**. It exposes endpoints used by Open-WebUI via a filter plugin.
@@ -10,6 +26,8 @@
 
 ## Where Things Live
 
+### Memory Service
+
 - **FastAPI app:** `docker/tools-api/app/main.py` mounts static plugin at `/.well-known` and includes router at `/api/memory`.
 - **Router:** `docker/tools-api/app/api/memory.py` implements `/save` and `/search`.
 - **Embeddings:** `docker/tools-api/app/services/embedder.py` uses `SentenceTransformer("all-mpnet-base-v2")`, normalized, 768‑dim.
@@ -18,7 +36,18 @@
 - **Open‑WebUI Filter:** `docker/tools-api/app/memory.filter.py` sends to `http://memory_api:8000/api/memory/save` and injects context.
 - **Plugin files:** `docker/tools-api/app/static/` contains `ai-plugin.json` and `openapi.yaml` served under `/.well-known`.
 
+### Extractor Service (Image/Audio/PDF)
+
+- **Extractor app:** `tools-api/extractor/main.py` FastAPI server on port `8002`.
+- **Router:** `tools-api/extractor/api/extractor.py` implements `/extract` endpoint (accepts base64-encoded content).
+- **Image extraction:** `tools-api/extractor/services/image_extractor.py` uses **LLaVA-1.5-7B** (4-bit quantized, ~4GB VRAM) or Florence-2 fallback. Model selected via `IMAGE_MODEL` env var (`llava-4bit`, `llava`, or `florence`). **Note:** Model loads lazily on first request and persists for container lifetime.
+- **Audio extraction:** `tools-api/extractor/services/audio_extractor.py` uses Whisper for transcription.
+- **PDF extraction:** `tools-api/extractor/services/pdf_extractor.py` uses PyMuPDF.
+- **Text chunking:** `tools-api/extractor/services/chunker.py` handles text/markdown segmentation.
+
 ## Conventions & Patterns
+
+### Memory Service
 
 - **Message content:** `content` may be `str` or `List[dict]` with items like `{type: "text", text: "..."}` or `{type: "image_url", ...}`. Embedding extracts text and tags images as `[image]`.
 - **Deterministic IDs:** Points use `_make_uuid(user_id, content_hash)` producing 64‑bit int for Qdrant `id`.
@@ -26,6 +55,12 @@
 - **Search first, save always (if worth):** `/save` runs REST search against Qdrant for existing context, then upserts current memory if worth saving. If context exists, `status` becomes `saved_with_context`.
 - **Direct Qdrant REST for search:** Although the Python client exists, searches in `memory.py` use `requests` against Qdrant HTTP API for speed/control. Results are limited and gated by a high `score_threshold` to avoid injecting unrelated context.
 - **CORS/Static:** `main.py` whitelists common local origins, and mounts plugin files at `/.well-known`.
+
+### Extractor Service
+
+- **Image model routing:** `image_extractor.py` checks `_model_type in ("llava", "llava-4bit")` to route to `_generate_llava()`, else falls back to `_generate_florence()`. **Bug fix (2025-12-19):** Ensured both "llava" and "llava-4bit" are routed correctly; previously only "llava" was checked, causing "llava-4bit" to incorrectly attempt Florence inference.
+- **Lazy model loading:** Models load on first request (not container startup) via `_load_model()` and persist in module globals (`_model`, `_processor`, `_device`, `_dtype`, `_model_type`) for the container lifetime. No explicit unload between requests.
+- **Content type detection:** Examines `content_type` header to dispatch to text chunking, image description, audio transcription, or PDF extraction.
 
 ## Build, Run, Debug
 
@@ -66,7 +101,16 @@
 
 ## Guardrails for Agents
 
+### Memory Service
+
 - Do not change collection params unless migrating existing data; `_ensure_collection` purposely avoids modifying existing collections.
 - Preserve `Message` shape and mixed `content` handling to avoid losing multi‑modal context.
 - Keep embedding model and dim in sync across `embedder.py` and Qdrant `VectorParams(size=768)`.
 - When adding endpoints, follow router style in `app/api/memory.py` and use schemas in `app/utils/schemas.py`.
+
+### Extractor Service
+
+- Model routing in `extract_from_image()` must check both `"llava"` and `"llava-4bit"` variants; do not break the condition.
+- Do not unload models between requests; lazy loading and persistence is intentional for performance.
+- Respect `IMAGE_MODEL` env var for model selection; support fallback logic (llava → florence).
+- Keep model quantization config (`BitsAndBytesConfig`) in sync with `_load_llava_4bit()` and docker-compose env vars (`IMAGE_MODEL=llava-4bit`, `HF_HOME=/models`).

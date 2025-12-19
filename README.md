@@ -92,32 +92,24 @@ Invoke-RestMethod -Method Post `
 
 ```
 tools-api/
-├── memory/
+│
+├── <tool>/
 │   ├── main.py                 # FastAPI entry point
-│   ├── memory.filter.py        # Open-WebUI filter plugin
+│   ├── <tool>.filter.py        # Open-WebUI filter plugin
 │   ├── api/
-│   │   └── memory.py           # REST endpoints (search/save with score gap filter)
+│   │   └── *.py                # REST endpoints (search/save with score gap filter)
 │   ├── services/
-│   │   ├── embedder.py         # SentenceTransformer embeddings
-│   │   ├── qdrant_client.py    # Qdrant singleton client
-│   │   ├── fact_extractor.py   # Regex-based fact extraction
-│   │   └── summarizer.py       # Text summarization
+│   │   ├── *.py       # Service layer
 │   ├── utils/
-│   │   └── schemas.py          # Pydantic models
+│   │   └── schemas.py          # Shared logic
 │   └── static/
 │       ├── ai-plugin.json      # Plugin manifest
 │       └── openapi.yaml        # API spec
-├── extractor/
-│   ├── main.py                 # Extraction service entry
+│
+├── <tool 2>/
+│   ├── **/*.py
 │   └── services/
-│       ├── image_extractor.py  # Florence-2 / BLIP captioning
-│       ├── audio_extractor.py  # Whisper transcription
-│       ├── pdf_extractor.py    # PDF text extraction
-│       └── chunker.py          # Markdown-aware text chunking
-└── pragmatics/
-    ├── server.py               # Classifier service
-    └── services/
-        └── classifier.py       # DistilBERT save/recall classifier
+│       ├── ...
 ```
 
 ## Filter Plugin

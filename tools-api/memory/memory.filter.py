@@ -33,10 +33,14 @@ MEMORY_API_URL = "http://memory_api:8000"
 EXTRACTOR_API_URL = "http://extractor_api:8002"
 
 
-def _extract_images_from_messages(messages: List[dict]) -> List[dict]:
+def _extract_images_from_messages(messages: List[dict], user_prompt: Optional[str] = None) -> List[dict]:
     """
     Extract images embedded in message content (image_url type items).
     Returns list of image chunks with descriptions from extractor.
+    
+    Args:
+        messages: List of message dicts
+        user_prompt: The user's text prompt for context-aware image descriptions
     """
     image_chunks = []
     
@@ -94,7 +98,8 @@ def _extract_images_from_messages(messages: List[dict]) -> List[dict]:
                         "content_type": content_type,
                         "source_name": f"image_{idx}",
                         "chunk_size": 500,
-                        "chunk_overlap": 0
+                        "chunk_overlap": 0,
+                        "prompt": user_prompt  # Pass user's question for context-aware description
                     },
                     timeout=120
                 )
@@ -379,13 +384,39 @@ class Filter:
             # Extract file contents and get chunks
             file_content, filenames, chunks = _extract_file_contents(body)
             
-            # Also extract images embedded in messages
-            image_chunks = _extract_images_from_messages(messages)
+            # Extract user's text prompt from the last user message (for context-aware image description)
+            user_text_prompt = None
+            if messages:
+                last_msg = messages[-1]
+                if last_msg.get("role") == "user":
+                    content = last_msg.get("content")
+                    if isinstance(content, str):
+                        user_text_prompt = content
+                    elif isinstance(content, list):
+                        # Extract text items from multi-modal content
+                        text_parts = []
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                text_parts.append(item.get("text", ""))
+                        user_text_prompt = " ".join(text_parts) if text_parts else None
+            
+            # Also extract images embedded in messages (pass user prompt for context)
+            image_chunks = _extract_images_from_messages(messages, user_prompt=user_text_prompt)
+            immediate_image_context = []  # For injecting image descriptions immediately
             if image_chunks:
                 print(f"[filter] Found {len(image_chunks)} image chunks from messages")
                 chunks.extend(image_chunks)
                 if not filenames:
                     filenames = ["uploaded_image"]
+                # Collect image descriptions for immediate injection
+                for img_chunk in image_chunks:
+                    desc = img_chunk.get("content", "")
+                    if desc:
+                        immediate_image_context.append({
+                            "user_text": f"[Image description]: {desc}",
+                            "source_type": "image",
+                            "source_name": img_chunk.get("source_name", "uploaded_image")
+                        })
             
             source_type = None
             source_name = None
@@ -489,11 +520,22 @@ class Filter:
             # Parse response
             result = response.json()
             status = result.get("status", "unknown")
-            existing_context = result.get("existing_context")
+            existing_context = result.get("existing_context") or []
+            
+            # Merge immediate image context with retrieved context
+            # Image descriptions should come first so the model sees them
+            if immediate_image_context:
+                existing_context = immediate_image_context + existing_context
+                # Update status if we have image context
+                if status == "skipped":
+                    status = "context_found"
+                elif status == "saved":
+                    status = "saved_with_context"
+            
             ctx_count = len(existing_context) if existing_context else 0
             
             # Single consolidated log line
-            print(f"[filter] inlet: user={user_id} msgs={len(messages)} files={len(filenames)} chunks={chunks_saved} status={status} context={ctx_count}")
+            print(f"[filter] inlet: user={user_id} msgs={len(messages)} files={len(filenames)} chunks={chunks_saved} status={status} context={ctx_count} img_ctx={len(immediate_image_context)}")
             
             # Update status based on what happened
             if status == "saved_with_context":

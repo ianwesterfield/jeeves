@@ -36,6 +36,7 @@ class ExtractRequest(BaseModel):
     source_name: Optional[str] = None
     chunk_size: int = 500  # Target tokens per chunk
     chunk_overlap: int = 50  # Overlap between chunks
+    prompt: Optional[str] = None  # Optional prompt for guided image description
 
 
 class ExtractResponse(BaseModel):
@@ -84,7 +85,7 @@ async def extract(req: ExtractRequest):
             # Image description
             source_type = "image"
             image_data = base64.b64decode(req.content)
-            description = await extract_from_image(image_data)
+            description = await extract_from_image(image_data, prompt=req.prompt)
             chunks = [Chunk(
                 content=description,
                 chunk_index=0,

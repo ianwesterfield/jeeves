@@ -35,14 +35,14 @@ services:
     image: qdrant/qdrant:latest
     container_name: qdrant
     environment:
-      - QDRANT_LOG_LEVEL=DEBUG
+      - QDRANT__LOG_LEVEL=DEBUG
       # Flush WAL more frequently to reduce corruption risk on shutdown
       - QDRANT__STORAGE__OPTIMIZERS__FLUSH_INTERVAL_SEC=1
     ports:
-      - "5100:5100"
-      - "6333:6333"
+      - "5100:5100" # Dashboard UI
+      - "6333:6333" # HTTP API
     volumes:
-      - qdrant_storage:/qdrant/storage
+      - C:/docker-data/qdrant/storage:/qdrant/storage
     restart: unless-stopped
     # Give Qdrant time to flush WAL and close cleanly
     stop_grace_period: 30s
@@ -63,7 +63,10 @@ services:
       - INDEX_NAME=user_memory_collection
       - EMBEDDING_PROVIDER=sentence_transformers
       - SUMMARY_MODEL=sshleifer/distilbart-cnn-12-6
-      - SUMMARY_DEVICE=cpu
+      - SUMMARY_DEVICE=0 # Use cpu for summarizer (or 0 for GPU)
+      - HF_HOME=/models
+    volumes:
+      - C:/docker-data/models:/models
     ports:
       - "8000:8000"
     depends_on:
@@ -96,11 +99,14 @@ services:
       context: ./tools-api/extractor
       dockerfile: Dockerfile
     container_name: extractor_api
+    ports:
+      - "8002:8002"
     environment:
       - WHISPER_MODEL=base
+      - IMAGE_MODEL=llava-4bit # Options: llava-4bit (~4GB), llava (~14GB), florence (~4GB)
+      - HF_HOME=/models
     volumes:
-      # Cache models between restarts
-      - extractor_cache:/root/.cache
+      - C:/docker-data/models:/models
     deploy:
       resources:
         reservations:
@@ -125,8 +131,9 @@ services:
       - GLOBAL_LOG_LEVEL=DEBUG
       - OLLAMA_BASE_URL=http://ollama:11434
 
-      - WEBUI_ADMIN_USERNAME=`$(cat ./secrets/webui_username.txt)` # Reference to local file for admin username
-      - WEBUI_ADMIN_PASSWORD=`$(cat ./secrets/webui_password.txt)` # Reference to local file for admin password
+      # Note: Set these manually or use docker secrets in production
+      # - WEBUI_ADMIN_USERNAME=admin
+      # - WEBUI_ADMIN_PASSWORD=changeme
 
       - RAG_EMBEDDING_ENGINE=ollama
       - EMBEDDING_MODEL=BAAI/bge-large-en-v1.5
@@ -148,9 +155,3 @@ services:
     restart: unless-stopped
     networks:
       - webtools_network
-
-volumes:
-  qdrant_storage:
-    driver: local
-  extractor_cache:
-    driver: local
