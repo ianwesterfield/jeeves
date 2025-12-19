@@ -92,24 +92,17 @@ Invoke-RestMethod -Method Post `
 
 ```
 tools-api/
-│
 ├── <tool>/
 │   ├── main.py                 # FastAPI entry point
-│   ├── <tool>.filter.py        # Open-WebUI filter plugin
-│   ├── api/
-│   │   └── *.py                # REST endpoints (search/save with score gap filter)
-│   ├── services/
-│   │   ├── *.py       # Service layer
-│   ├── utils/
-│   │   └── schemas.py          # Shared logic
+│   ├── filter.py               # Open-WebUI filter plugin
+│   ├── api/                    # REST endpoints (search/save with score gap filter)
+│   ├── services/               # Service layer
+│   ├── utils/                  # Shared logic
 │   └── static/
 │       ├── ai-plugin.json      # Plugin manifest
 │       └── openapi.yaml        # API spec
-│
 ├── <tool 2>/
-│   ├── **/*.py
-│   └── services/
-│       ├── ...
+│   ├── ...
 ```
 
 ## Filter Plugin
