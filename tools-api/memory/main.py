@@ -1,64 +1,83 @@
 """
-Jeeves Memory Service - Main Entry Point
+Memory Service - Semantic Memory Layer for Open-WebUI
 
-This is my semantic memory layer for Open-WebUI. It captures conversations,
-extracts facts, generates embeddings, and stores everything in Qdrant so I 
-can recall relevant context later.
+Captures conversations, generates embeddings, and stores them in Qdrant
+for retrieval and context injection on future messages.
 
-Stack:
-    - FastAPI with CORS for Open-WebUI integration
-    - Qdrant vector DB for semantic storage
-    - SentenceTransformers (all-mpnet-base-v2) for 768-dim embeddings
-    - Pattern-based fact extraction for structured data
-    - My pragmatics classifier to decide what's worth saving
+Architecture:
+  - FastAPI server with CORS/static file support
+  - SentenceTransformers (all-mpnet-base-v2) for embeddings (768-dim)
+  - Qdrant vector database for storage/search
+  - Pragmatics classifier for save/recall intent detection
+  - Filter plugin for Open-WebUI integration
 
 Endpoints:
-    POST /api/memory/save      - Save a conversation
-    POST /api/memory/search    - Search memories
-    POST /api/memory/summaries - Get memory summaries
-    GET  /api/memory/filter    - Serve the filter plugin for Open-WebUI
-    GET  /.well-known/*        - Static plugin manifest files
+  POST /api/memory/save       - Save conversation with embedding
+  POST /api/memory/search     - Search for similar memories
+  POST /api/memory/summaries  - Get memory summaries
+  GET  /api/memory/filter     - Serve Open-WebUI filter plugin
+  GET  /.well-known/*         - Plugin manifest files (ai-plugin.json, openapi.yaml)
 
-Env vars:
-    QDRANT_HOST, QDRANT_PORT, INDEX_NAME, PRAGMATICS_HOST, PRAGMATICS_PORT
+Environment:
+  QDRANT_HOST, QDRANT_PORT, INDEX_NAME
+  PRAGMATICS_HOST, PRAGMATICS_PORT
 """
 
-import inspect
+import logging
+from pathlib import Path
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import PlainTextResponse
-from pathlib import Path
+from fastapi.staticfiles import StaticFiles
+
 from api import memory
+from services.embedder import embed
 
-print("[main] Starting OpenWebUI Memory Service...")
 
-app = FastAPI(
-    title="OpenWebUI Memory Service",
-    version="1.0",
-    description="Semantic memory layer for Open-WebUI conversations",
+# ============================================================================
+# Logging
+# ============================================================================
+
+logger = logging.getLogger("memory.main")
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(name)s - %(levelname)s - %(message)s",
 )
 
 
-@app.on_event("startup")
-async def preload_models() -> None:
-    """Load the embedding model at startup so the first request isn't slow."""
-    print("[main] Preloading embedding model...")
-    from services.embedder import embed
-    embed("warmup")
-    print("[main] Embedding model loaded and ready.")
+# ============================================================================
+# Application Setup
+# ============================================================================
+
+logger.info("Initializing Memory Service...")
+
+app = FastAPI(
+    title="Memory Service",
+    description="Semantic memory layer for Open-WebUI (save/search conversations)",
+    version="1.0.0",
+)
+
+
+# ============================================================================
+# Middleware
+# ============================================================================
 
 @app.middleware("http")
-async def log_requests(request: Request, call_next):
-    """Simple request/response logging for debugging."""
-    print(f"[main] Incoming request: {request.method} {request.url.path}")
+async def request_logging_middleware(request: Request, call_next):
+    """Log all HTTP requests for debugging."""
+    logger.debug(f"→ {request.method:6s} {request.url.path}")
     response = await call_next(request)
-    print(f"[main] Response status: {response.status_code}")
+    logger.debug(f"← {response.status_code} {request.url.path}")
     return response
 
 
-# CORS - allowing my local dev origins
-origins = [
+# ============================================================================
+# CORS Configuration
+# ============================================================================
+
+# Allow local development origins and docker services
+ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "http://localhost:3001",
@@ -68,32 +87,85 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Plugin manifest files for Open-WebUI discovery
+logger.info(f"CORS enabled for: {', '.join(ALLOWED_ORIGINS)}")
+
+
+# ============================================================================
+# Static Files (Plugin Manifests)
+# ============================================================================
+
 static_dir = Path(__file__).resolve().parent / "static"
-print(f"[main] Mounting static files from {static_dir}")
+logger.info(f"Mounting static files from: {static_dir}")
+
 app.mount("/.well-known", StaticFiles(directory=str(static_dir)), name="static")
 
-# Memory API routes
-print("[main] Including memory router at /api/memory")
+
+# ============================================================================
+# Startup Events
+# ============================================================================
+
+@app.on_event("startup")
+async def startup_event():
+    """
+    Preload models at startup.
+    
+    - Loads embedding model (all-mpnet-base-v2) for sub-second first request
+    - Connects to Qdrant and initializes collection if needed
+    """
+    logger.info("[startup] Preloading embedding model...")
+    try:
+        embed("warmup")  # Warmup call to load model
+        logger.info("[startup] ✓ Embedding model ready")
+    except Exception as e:
+        logger.warning(f"[startup] ⚠ Failed to preload embedding model: {e}")
+
+
+# ============================================================================
+# Routers
+# ============================================================================
+
+logger.info("Registering memory router at /api/memory")
 app.include_router(memory.router, prefix="/api/memory")
 
+
+# ============================================================================
+# Filter Plugin Endpoint
+# ============================================================================
 
 @app.get("/api/memory/filter", response_class=PlainTextResponse)
 def get_memory_filter() -> str:
     """
-    Serve the filter plugin source for Open-WebUI.
-    Open-WebUI parses this to find the Filter class and wire it up.
+    Serve the Open-WebUI filter plugin source code.
+    
+    Open-WebUI periodically calls this endpoint to fetch the filter plugin
+    source, parses it to find the Filter class, and instantiates it to
+    intercept conversations for memory operations.
+    
+    Returns: Complete Python source of memory.filter.py
     """
-    print("[main] GET /api/memory/filter called")
-    functions_module_path = Path(__file__).resolve().parent / "memory.filter.py"
-    with open(functions_module_path, "r", encoding="utf-8") as f:
-        return f.read()
+    logger.debug("[filter] Serving filter plugin source")
+    filter_path = Path(__file__).resolve().parent / "memory.filter.py"
+    return filter_path.read_text(encoding="utf-8")
 
 
-print("[main] Memory service initialized and ready")
+# ============================================================================
+# Health Check
+# ============================================================================
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for orchestration."""
+    return {"status": "healthy"}
+
+
+# ============================================================================
+# Ready
+# ============================================================================
+
+logger.info("✓ Memory Service initialized and ready")

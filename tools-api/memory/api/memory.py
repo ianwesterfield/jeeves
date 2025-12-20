@@ -263,7 +263,7 @@ def save_memory(req: SaveRequest) -> Dict[str, Any]:
                     ]
                 },
                 "limit": 5,  # Get more results to find relevant docs
-                "score_threshold": 0.45,  # Lower threshold to catch document chunks
+                "score_threshold": 0.35,  # Lower threshold to catch context from previous messages/images
                 "with_payload": True,
             },
             timeout=5
@@ -439,7 +439,9 @@ def search_memory(req: SearchRequest) -> List[MemoryResult]:
             MemoryResult(
                 user_text=pt.get("payload", {}).get("user_text", ""),
                 messages=None,
-                score=pt.get("score", 0)
+                score=pt.get("score", 0),
+                source_type=pt.get("payload", {}).get("source_type"),
+                source_name=pt.get("payload", {}).get("source_name")
             )
             for pt in results
         ]

@@ -4,7 +4,7 @@ My semantic memory layer for Open-WebUI. It remembers what you tell it—names, 
 
 ## What It Does
 
-Every conversation flows through a filter plugin that decides what's worth remembering. Things like "My name is Ian" or "I work at Satcom Direct" get extracted and stored. Documents get chunked and indexed. Images get described by vision models. When you ask something later, Jeeves searches for related memories and injects them into the conversation so the model has context.
+Every conversation flows through a filter plugin that decides what's worth remembering. Things like "My name is Ian" or "Jesus is Christ" get extracted and stored. Documents get chunked and indexed. Images get described by vision models. When you ask something later, Jeeves searches for related memories and injects them into the conversation so the model has context.
 
 **Endpoints:**
 

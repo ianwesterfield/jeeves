@@ -1,0 +1,31 @@
+
+# Extractor Service - Media to Text Conversion
+# Supports: Text, Markdown, Images (LLaVA/Florence), Audio (Whisper), PDF
+
+# Core FastAPI
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+
+# ML & NLP
+numpy<2
+transformers>=4.40.0
+torch>=2.2.0
+torchvision>=0.17.0
+torchaudio>=2.2.0
+
+# Vision models (LLaVA & Florence-2)
+timm>=0.9.10          # Vision model layers
+einops>=0.8.0         # Tensor operations for vision models
+accelerate>=0.28.0    # Model loading optimizations
+bitsandbytes>=0.42.0  # 4-bit quantization for LLaVA
+
+# Audio transcription (Whisper)
+openai-whisper>=20240930
+
+# Image/PDF processing
+Pillow>=10.0.0
+pymupdf>=1.23.0
+
+# File type detection
+python-magic>=0.4.27

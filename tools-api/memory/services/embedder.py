@@ -28,9 +28,13 @@ def _extract_text_from_content(content: List[dict] | str) -> str:
         return content
     
     text_parts = []
+    
     if isinstance(content, list):
+        
         for item in content:
+            
             if isinstance(item, dict):
+    
                 if item.get("type") == "text" and "text" in item:
                     text_parts.append(item["text"])
                 elif item.get("type") == "image_url":

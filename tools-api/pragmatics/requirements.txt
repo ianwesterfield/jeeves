@@ -1,0 +1,15 @@
+
+# Pragmatics Service - Intent Classification
+# Classifies if user message should trigger save/recall in memory system
+
+# Core FastAPI
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic>=2.0.0
+
+# ML & NLP
+numpy<2
+torch==2.2.0
+transformers==4.41.0
+sentencepiece==0.2.0
+scikit-learn>=1.3.0
