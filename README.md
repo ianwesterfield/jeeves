@@ -50,13 +50,71 @@ User message → Filter plugin → Memory API → Qdrant
 
 ## Running It
 
-```powershell
-# Full stack with Open-WebUI
-docker compose up -d --build
+### Quick Start (Uses Pre-built Base Images)
 
-# Rebuild specific service
+```powershell
+# Full stack - pulls base images, only rebuilds app code (~10 seconds)
+docker compose up -d --build
+```
+
+### Building Base Images (First Time or After requirements.txt Changes)
+
+Base images contain system dependencies + pip packages. Build once, reuse forever:
+
+```powershell
+# Build all base images locally
+.\build-base-images.ps1
+
+# Or build and push to Docker Hub for team sharing
+.\build-base-images.ps1 -Registry "yourusername" -Push
+```
+
+### Using Custom Registry
+
+```powershell
+# Set your Docker Hub username
+$env:BASE_REGISTRY = "yourusername"
+docker compose up -d --build
+```
+
+Or create a `.env` file:
+
+```
+BASE_REGISTRY=yourusername
+```
+
+### Rebuild Specific Service
+
+```powershell
 docker compose build memory_api && docker compose up -d memory_api
 ```
+
+## Build Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Base Images (build once, ~35 min)                         │
+│  ├─ jeeves/memory-base:latest     (python + pip packages)  │
+│  ├─ jeeves/extractor-base:latest  (python + pip + torch)   │
+│  └─ jeeves/pragmatics-base:latest (python + pip packages)  │
+└─────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  App Images (rebuild on code changes, ~10 sec)             │
+│  ├─ FROM jeeves/memory-base + COPY app code               │
+│  ├─ FROM jeeves/extractor-base + COPY app code            │
+│  └─ FROM jeeves/pragmatics-base + COPY app code           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**When to rebuild base images:**
+
+- After updating `requirements.txt`
+- After updating system dependencies in `Dockerfile.base`
+- First time setup on new machine
+
+**Regular development:** Just `docker compose up -d --build` (~10 seconds)
 
 ## Environment Variables
 

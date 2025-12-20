@@ -1,28 +1,3 @@
-"""
-Memory Service - Semantic Memory Layer for Open-WebUI
-
-Captures conversations, generates embeddings, and stores them in Qdrant
-for retrieval and context injection on future messages.
-
-Architecture:
-  - FastAPI server with CORS/static file support
-  - SentenceTransformers (all-mpnet-base-v2) for embeddings (768-dim)
-  - Qdrant vector database for storage/search
-  - Pragmatics classifier for save/recall intent detection
-  - Filter plugin for Open-WebUI integration
-
-Endpoints:
-  POST /api/memory/save       - Save conversation with embedding
-  POST /api/memory/search     - Search for similar memories
-  POST /api/memory/summaries  - Get memory summaries
-  GET  /api/memory/filter     - Serve Open-WebUI filter plugin
-  GET  /.well-known/*         - Plugin manifest files (ai-plugin.json, openapi.yaml)
-
-Environment:
-  QDRANT_HOST, QDRANT_PORT, INDEX_NAME
-  PRAGMATICS_HOST, PRAGMATICS_PORT
-"""
-
 import logging
 from pathlib import Path
 

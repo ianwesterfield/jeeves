@@ -1,25 +1,3 @@
-"""
-Open-WebUI Memory Filter Plugin
-
-Intercepts Open-WebUI conversations to:
-  1. Extract and chunk uploaded documents (files, images, audio)
-  2. Send chunks to memory service for embedding + storage
-  3. Search for relevant past context
-  4. Inject context into conversation before LLM sees it
-
-Data Flow:
-  User uploads file/image → Extract → Chunk → Save to Qdrant
-           ↓
-  User sends message → Search Qdrant for context → Inject if found
-           ↓
-  Modified conversation → LLM
-
-
-Status Icons:
-  ✨ Searching     🧠 Found/saved  📄 Document  💬 Prompt
-  🖼 Image         ⏭ Skipped       ⚠ Error      ✔ Done
-"""
-
 import os
 import re
 import json
@@ -535,7 +513,9 @@ class Filter:
         
         # Find last user message and prepend context
         messages = body.get("messages", [])
+        
         for i in range(len(messages) - 1, -1, -1):
+        
             if messages[i].get("role") == "user":
                 content = messages[i].get("content", "")
                 
@@ -619,6 +599,7 @@ class Filter:
             
             # Search memory
             source_type = "document" if chunks else "prompt"
+            
             if chunks:
                 source_name = filenames[0] if filenames else "attachment"
             else:
@@ -649,11 +630,13 @@ class Filter:
                         "hidden": False,
                     }
                 })
+                
                 for ctx in context:
                     await __event_emitter__({
                         "type": "status",
                         "data": {"description": f"  • {_format_source(ctx)}", "done": False, "hidden": False}
                     })
+                
                 await __event_emitter__({
                     "type": "status",
                     "data": {"description": "✔ Context injected", "done": True, "hidden": False}
@@ -661,6 +644,7 @@ class Filter:
                 body = self._inject_context(body, context)
             
             elif status == "context_found":
+                
                 await __event_emitter__({
                     "type": "status",
                     "data": {
@@ -669,15 +653,18 @@ class Filter:
                         "hidden": False,
                     }
                 })
+                
                 for ctx in context:
                     await __event_emitter__({
                         "type": "status",
                         "data": {"description": f"  • {_format_source(ctx)}", "done": False, "hidden": False}
                     })
+                
                 await __event_emitter__({
                     "type": "status",
                     "data": {"description": "✔ Context injected", "done": True, "hidden": False}
                 })
+                
                 body = self._inject_context(body, context)
             
             elif status == "saved":
@@ -703,10 +690,12 @@ class Filter:
         
         except Exception as e:
             print(f"[filter] Error: {e}")
+            
             await __event_emitter__({
                 "type": "status",
                 "data": {"description": f"⚠ Error: {str(e)[:40]}", "done": True, "hidden": False}
             })
+            
             return body
     
     async def outlet(self, body: dict, __event_emitter__, __user__: Optional[dict] = None) -> None:

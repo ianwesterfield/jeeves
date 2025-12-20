@@ -1,25 +1,22 @@
-# ---- CPU-only pragmatics service ----
-FROM python:3.11-slim
+# =============================================================================
+# Jeeves Pragmatics API - Application Image
+# =============================================================================
+# Builds FROM pre-published base image (contains system deps + pip packages)
+# Only copies application code - rebuilds in ~10 seconds
+#
+# To rebuild base: see Dockerfile.base
+# =============================================================================
 
-# Layer 1: System packages (rarely changes)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-  git curl \
-  && rm -rf /var/lib/apt/lists/*
+ARG BASE_REGISTRY=jeeves
+FROM ${BASE_REGISTRY}/jeeves-pragmatics-base:latest
 
 WORKDIR /app
 
-# Layer 2: Copy requirements for caching
-COPY requirements.txt .
-
-# Layer 3: Install Python packages (cached if requirements.txt unchanged)
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Layer 4: Copy application code (changes frequently)
+# Only application code (the fast-changing layer)
 COPY . /app
 
 # Move trained model if present
 RUN if [ -d /app/static/distilbert_memory ]; then mv /app/static/distilbert_memory /app/distilbert_memory; fi
 
 EXPOSE 8001
-
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8001"]

@@ -1,0 +1,27 @@
+# =============================================================================
+# Jeeves Extractor API - Base Image
+# =============================================================================
+# Contains: Python 3.11 + system deps (ffmpeg, git) + all pip packages
+# Publish:  docker build -f Dockerfile.base -t <hub>/jeeves-extractor-base:latest .
+#           docker push <hub>/jeeves-extractor-base:latest
+#
+# This image rarely changes (only when requirements.txt is updated)
+# WARNING: This is the largest base (~4GB with torch + CUDA libs)
+# =============================================================================
+
+FROM python:3.11-slim
+
+# System dependencies (ffmpeg for audio, git for pip installs)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  ffmpeg \
+  libsndfile1 \
+  git \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Python packages (the expensive layer - torch, transformers, etc.)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Base image stops here - no application code
