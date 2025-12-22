@@ -125,6 +125,46 @@ services:
       - webtools_network
 
   # -------------------------------------------------
+  # Orchestrator API (Agentic Reasoning Engine)
+  # -------------------------------------------------
+  orchestrator_api:
+    build:
+      context: ./tools-api/orchestrator
+      dockerfile: Dockerfile
+    container_name: orchestrator_api
+    ports:
+      - "8004:8004"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=llama3.2
+      - MEMORY_API_URL=http://memory_api:8000
+      - EXECUTOR_API_URL=http://executor_api:8005
+      - MAX_PARALLEL_TASKS=5
+    depends_on:
+      - ollama
+      - memory_api
+    restart: unless-stopped
+    networks:
+      - webtools_network
+
+  # -------------------------------------------------
+  # Executor API (Polyglot Code Execution)
+  # -------------------------------------------------
+  executor_api:
+    build:
+      context: ./tools-api/executor
+      dockerfile: Dockerfile
+    container_name: executor_api
+    ports:
+      - "8005:8005"
+    environment:
+      - DEFAULT_TIMEOUT=30
+      - MAX_TIMEOUT=120
+    restart: unless-stopped
+    networks:
+      - webtools_network
+
+  # -------------------------------------------------
   # Open-WebUI
   # -------------------------------------------------
   open-webui:
