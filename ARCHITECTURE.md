@@ -13,57 +13,51 @@ Jeeves is a semantic memory system for Open-WebUI that captures conversation con
 
 ## System Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      Open-WebUI (User)                          │
-└────────┬──────────────────────────────────────────────┬─────────┘
-         │                                              │
-         │ (Conversation with attachment)              │
-         ▼                                              ▼
-    ┌─────────────────────┐              ┌─────────────────────┐
-    │  Filter.inlet()     │              │  Assistant Response │
-    │  (memory.filter.py) │◄─────────────┤  (User reads LLM)   │
-    └──────────┬──────────┘              └─────────────────────┘
-               │                                  ▲
-         1. Extract files/images                 │
-         2. Save chunks to memory                │ 4. Inject context
-         3. Search for context                   │    if found
-         4. Inject into request                  │
-               │                                  │
-               ▼                                  │
-    ┌─────────────────────────────────────────────────────┐
-    │          Memory API (FastAPI)                       │
-    │  Routes: /api/memory/save, /search, /summaries      │
-    │                                                     │
-    │  1. Receive chunks from filter                     │
-    │  2. Classify importance (Pragmatics intent check)  │
-    │  3. Embed with SentenceTransformer                 │
-    │  4. Upsert to Qdrant                               │
-    │  5. Search for existing context                    │
-    │  6. Return context + status to filter              │
-    └────────────┬────────────────────┬──────────────────┘
-                 │                    │
-        Embedding │                    │ Search/Upsert
-                 │                    │
-    ┌────────────▼──────────────────────▼──┐
-    │  Qdrant Vector Database              │
-    │  Collection: user_memory_collection   │
-    │  Dimension: 768 (all-mpnet-base-v2)  │
-    │  Similarity: COSINE                  │
-    │  Threshold: 0.35 (improved recall)   │
-    └─────────────────────────────────────┘
-         │                    │
-         │                    │ Chunks from files/images
-         │                    │
-    ┌────▼──────┐       ┌─────▼─────────────────────┐
-    │ Pragmatics │       │  Extractor API            │
-    │ Classifier │       │  • Image → LLaVA descr.   │
-    │            │       │  • Audio → Whisper        │
-    │ Save vs    │       │  • PDF → PyMuPDF text     │
-    │ Other      │       │  • Code → Chunk by func   │
-    │ Intent     │       │                           │
-    │ (0.70 thr) │       └───────────────────────────┘
-    └────────────┘
+```mermaid
+flowchart TB
+    subgraph User["Open-WebUI (User)"]
+        UserInput["User sends message"]
+        UserReads["User reads response"]
+    end
+
+    subgraph Filter["Filter.inlet() - memory.filter.py"]
+        F1["1. Extract files/images"]
+        F2["2. Save chunks to memory"]
+        F3["3. Search for context"]
+        F4["4. Inject into request"]
+    end
+
+    subgraph MemoryAPI["Memory API (FastAPI)"]
+        direction TB
+        Routes["Routes: /save, /search, /summaries"]
+        M1["1. Receive chunks from filter"]
+        M2["2. Classify importance"]
+        M3["3. Embed with SentenceTransformer"]
+        M4["4. Upsert to Qdrant"]
+        M5["5. Search for existing context"]
+        M6["6. Return context + status"]
+    end
+
+    subgraph Qdrant["Qdrant Vector Database"]
+        QConfig["Collection: user_memory_collection<br/>Dimension: 768 (all-mpnet-base-v2)<br/>Similarity: COSINE<br/>Threshold: 0.35"]
+    end
+
+    subgraph Support["Support Services"]
+        Pragmatics["Pragmatics Classifier<br/>Save vs Other Intent<br/>(0.70 threshold)"]
+        Extractor["Extractor API<br/>• Image → LLaVA<br/>• Audio → Whisper<br/>• PDF → PyMuPDF<br/>• Code → Chunker"]
+    end
+
+    LLM["LLM Response"]
+
+    UserInput --> Filter
+    Filter --> MemoryAPI
+    MemoryAPI -->|"Embedding"| Qdrant
+    MemoryAPI -->|"Search/Upsert"| Qdrant
+    MemoryAPI --> Pragmatics
+    Filter --> Extractor
+    Extractor -->|"Chunks"| MemoryAPI
+    MemoryAPI -->|"Context injected"| LLM
+    LLM --> UserReads
 ```
 
 ---
@@ -72,79 +66,117 @@ Jeeves is a semantic memory system for Open-WebUI that captures conversation con
 
 ### 1. User sends message with attachment
 
-```
-User → Open-WebUI → Filter.inlet() {
+```mermaid
+sequenceDiagram
+    autonumber
+    participant User
+    participant WebUI as Open-WebUI
+    participant Filter as Filter.inlet()
+    participant Extractor as Extractor API
+    participant Memory as Memory API
+    participant LLM
 
-  Step 1: Extract
-  ├─ Image URLs (data:, http, local) → Extractor API
-  ├─ File uploads → Extractor API (PDF, text, code, audio)
-  └─ Result: List of text chunks with source metadata
+    User->>WebUI: Send message + attachment
+    WebUI->>Filter: Process request
 
-  Step 2: Save Chunks
-  ├─ POST /api/memory/save for each chunk
-  ├─ Memory API embeds and stores
-  └─ Status: saved | saved_with_context | skipped
+    rect rgb(230, 245, 255)
+        Note over Filter,Extractor: Step 1: Extract
+        Filter->>Extractor: Image URLs, file uploads
+        Extractor-->>Filter: Text chunks + metadata
+    end
 
-  Step 3: Search Memory
-  ├─ POST /api/memory/save (with user message)
-  ├─ Memory API searches Qdrant for similar past memories
-  └─ Returns: existing_context (list of past messages)
+    rect rgb(230, 255, 230)
+        Note over Filter,Memory: Step 2: Save Chunks
+        Filter->>Memory: POST /api/memory/save (each chunk)
+        Memory-->>Filter: Status: saved | saved_with_context | skipped
+    end
 
-  Step 4: Inject Context
-  ├─ If context found, prepend to user message
-  │  Format: "### Previous conversation context ###\n- ..."
-  └─ Modified message sent to LLM
+    rect rgb(255, 245, 230)
+        Note over Filter,Memory: Step 3: Search Memory
+        Filter->>Memory: POST /api/memory/save (user message)
+        Memory-->>Filter: existing_context (past messages)
+    end
 
-} → LLM → Response → User reads on screen
+    rect rgb(245, 230, 255)
+        Note over Filter: Step 4: Inject Context
+        Filter->>Filter: Prepend context to message
+    end
+
+    Filter->>LLM: Modified request
+    LLM-->>User: Response with context
 ```
 
 ### 2. Memory save flow
 
-```
-Filter submits chunk → Memory API {
+```mermaid
+flowchart TB
+    Start(["Filter submits chunk"]) --> Parse
 
-  1. Parse request (user_id, messages, source_type)
+    subgraph Step1["1. Parse Request"]
+        Parse["Parse user_id, messages, source_type"]
+    end
 
-  2. Check importance (unless skip_classifier=True for documents)
-     ├─ Extract text from content
-     ├─ Use KeyBERT + heuristics to detect keywords
-     ├─ If casual/musing → skip (e.g., "just curious")
-     └─ If important → proceed
+    subgraph Step2["2. Check Importance"]
+        Extract["Extract text from content"]
+        KeyBERT["KeyBERT + heuristics"]
+        Decision{"Important?"}
+        Extract --> KeyBERT --> Decision
+    end
 
-  3. Embed with SentenceTransformer
-     ├─ Model: all-mpnet-base-v2
-     ├─ Output: 768-dim vector, L2-normalized
-     └─ Time: ~50ms per message
+    subgraph Step3["3. Embed"]
+        Embed["SentenceTransformer<br/>all-mpnet-base-v2<br/>768-dim, L2-normalized<br/>~50ms"]
+    end
 
-  4. Generate summary (optional)
-     ├─ Model: distilbart-cnn-12-6 (summarizer)
-     ├─ Device: CPU or GPU (configurable)
-     └─ Stored alongside full text
+    subgraph Step4["4. Summarize (optional)"]
+        Summary["distilbart-cnn-12-6<br/>CPU or GPU"]
+    end
 
-  5. Upsert to Qdrant
-     ├─ ID: deterministic UUID(user_id, content_hash)
-     ├─ Vector: 768-dim embedding
-     ├─ Metadata: {user_id, chunk_index, section_title, source, timestamp}
-     └─ Payload: {summary, user_text, full_content}
+    subgraph Step5["5. Upsert to Qdrant"]
+        Upsert["ID: UUID(user_id, hash)<br/>Vector: 768-dim<br/>Metadata + Payload"]
+    end
 
-  6. Search for existing context (optional)
-     ├─ Query same embedding against Qdrant
-     ├─ Threshold: 0.35 (COSINE similarity)
-     ├─ Top-k: 5 results
-     └─ Filter by user_id
+    subgraph Step6["6. Search Context"]
+        Search["Query Qdrant<br/>Threshold: 0.35<br/>Top-k: 5"]
+    end
 
-  7. Return status + context to filter
-     ├─ Status: saved | saved_with_context | context_found | skipped
-     └─ Existing context items for injection
+    subgraph Step7["7. Return"]
+        Return["Status + Context"]
+    end
 
-} → Response to filter → Filter injects into request
+    Parse --> Step2
+    Decision -->|"Casual/musing"| Skip(["skipped"])
+    Decision -->|"Important"| Step3
+    Step3 --> Step4 --> Step5 --> Step6 --> Step7
+    Return --> Response(["Response to filter"])
 ```
 
 ### 3. Context injection
 
-```
-Existing Context Items (from Qdrant search):
+```mermaid
+flowchart LR
+    subgraph QdrantResults["Qdrant Search Results"]
+        R1["user_text: CI/CD setup...<br/>source_type: prompt"]
+        R2["user_text: [Image]: Dashboard...<br/>source_type: image"]
+    end
 
+    subgraph Formatter["Format for Injection"]
+        Header["### Previous conversation context ###"]
+        Item1["- I need to set up CI/CD..."]
+        Item2["- [Image]: The dashboard shows..."]
+        Footer["### End of context ###"]
+        UserMsg["[User's current message]"]
+    end
+
+    subgraph Output["Final Message"]
+        LLM["LLM receives full context"]
+    end
+
+    QdrantResults --> Formatter --> Output
+```
+
+**Example context payload:**
+
+```json
 [
   {
     "user_text": "I need to set up CI/CD for our Python project",
@@ -158,18 +190,6 @@ Existing Context Items (from Qdrant search):
     "source_name": "uploaded_image_0"
   }
 ]
-
-Formatted for injection:
-┌────────────────────────────────────────┐
-│ ### Previous conversation context ###  │
-│ - I need to set up CI/CD...            │
-│ - [Image]: The dashboard shows...      │
-│ ### End of context ###                 │
-│                                        │
-│ [User's current message]               │
-└────────────────────────────────────────┘
-
-User message → LLM (now has full context)
 ```
 
 ---
@@ -354,28 +374,34 @@ Search Parameters:
 
 ### Multi-stage Build Strategy
 
-Each service uses **3-layer caching** to minimize rebuild time:
+Each service uses a **base image** on Docker Hub + thin app layer:
 
-```dockerfile
-# Layer 1: System Dependencies (rarely changes)
-FROM python:3.11-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
-  [ffmpeg, git, gcc, etc.]
+```mermaid
+flowchart TB
+    subgraph DockerHub["Docker Hub (ianwesterfield/)"]
+        BaseMemory["jeeves-memory-base<br/>python:3.11-slim + deps"]
+        BaseExtractor["jeeves-extractor-base<br/>python:3.11-slim + torch"]
+        BasePragmatics["jeeves-pragmatics-base<br/>python:3.11-slim + deps"]
+    end
 
-# Layer 2: Python Packages (cached if requirements.txt unchanged)
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+    subgraph Local["Local Build (~30 sec)"]
+        AppMemory["memory_api<br/>FROM jeeves-memory-base<br/>COPY app code"]
+        AppExtractor["extractor_api<br/>FROM jeeves-extractor-base<br/>COPY app code"]
+        AppPragmatics["pragmatics_api<br/>FROM jeeves-pragmatics-base<br/>COPY app code"]
+    end
 
-# Layer 3: Application Code (changes frequently)
-COPY . /app
-CMD ["uvicorn", "main:app", ...]
+    BaseMemory --> AppMemory
+    BaseExtractor --> AppExtractor
+    BasePragmatics --> AppPragmatics
 ```
 
-**Cache Performance:**
+**Build Performance:**
 
-- **First build:** 35+ minutes (downloads torch ~900MB, other packages)
-- **Second build (code change only):** 2 seconds (all layers cached)
-- **First build (new requirements):** Full rebuild (~5-10 min with pip)
+| Scenario                       | Time    | Notes                              |
+| ------------------------------ | ------- | ---------------------------------- |
+| First build (with base images) | ~30 sec | Pulls base from Docker Hub         |
+| Code change only               | ~2 sec  | App layer rebuild only             |
+| Base image rebuild             | 35+ min | Only when requirements.txt changes |
 
 ### Docker Compose
 

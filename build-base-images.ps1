@@ -27,7 +27,7 @@
 
 param(
   [string]$Registry = "ianwesterfield",
-  [switch]$Push,
+  [switch]$Push = $true,
   [string[]]$Services = @("memory", "extractor", "pragmatics")
 )
 

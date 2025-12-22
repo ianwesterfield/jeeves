@@ -50,71 +50,111 @@ User message → Filter plugin → Memory API → Qdrant
 
 ## Running It
 
-### Quick Start (Uses Pre-built Base Images)
+### Quick Start
 
 ```powershell
-# Full stack - pulls base images, only rebuilds app code (~10 seconds)
+# Start everything (pulls base images from Docker Hub, builds app code)
 docker compose up -d --build
+
+# Check status
+docker ps
+
+# View logs
+docker logs memory_api -f
 ```
 
-### Building Base Images (First Time or After requirements.txt Changes)
+Build time: **~30 seconds** (base images are pre-built on Docker Hub)
 
-Base images contain system dependencies + pip packages. Build once, reuse forever:
+### When to Use `--build`
+
+| Scenario                    | Command                           |
+| --------------------------- | --------------------------------- |
+| Code changes (Python files) | `docker compose up -d --build`    |
+| Just restart containers     | `docker compose up -d`            |
+| Full rebuild from scratch   | `docker compose build --no-cache` |
+
+### Building Base Images (Maintainers Only)
+
+Base images contain system deps + pip packages. Only rebuild when `requirements.txt` changes:
 
 ```powershell
-# Build all base images locally
+# Build and push all base images to Docker Hub
+.\build-base-images.ps1 -Push
+
+# Build specific service only
+.\build-base-images.ps1 -Services "memory" -Push
+
+# Build locally without pushing
 .\build-base-images.ps1
-
-# Or build and push to Docker Hub for team sharing
-.\build-base-images.ps1 -Registry "yourusername" -Push
 ```
 
-### Using Custom Registry
+### Using Different Registry
 
-```powershell
-# Set your Docker Hub username
-$env:BASE_REGISTRY = "yourusername"
-docker compose up -d --build
-```
+Create a `.env` file:
 
-Or create a `.env` file:
-
-```
+```env
 BASE_REGISTRY=yourusername
 ```
 
-### Rebuild Specific Service
+Or set inline:
 
 ```powershell
-docker compose build memory_api && docker compose up -d memory_api
+$env:BASE_REGISTRY = "yourusername"
+docker compose up -d --build
 ```
 
 ## Build Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Base Images (build once, ~35 min)                         │
-│  ├─ jeeves/memory-base:latest     (python + pip packages)  │
-│  ├─ jeeves/extractor-base:latest  (python + pip + torch)   │
-│  └─ jeeves/pragmatics-base:latest (python + pip packages)  │
-└─────────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  App Images (rebuild on code changes, ~10 sec)             │
-│  ├─ FROM jeeves/memory-base + COPY app code               │
-│  ├─ FROM jeeves/extractor-base + COPY app code            │
-│  └─ FROM jeeves/pragmatics-base + COPY app code           │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  Base Images (Docker Hub: ianwesterfield/jeeves-*-base)         │
+│  Built once when requirements.txt changes (~35 min)              │
+│                                                                  │
+│  ├─ jeeves-memory-base:latest     (python + sentence-transformers) │
+│  ├─ jeeves-extractor-base:latest  (python + torch + whisper)       │
+│  └─ jeeves-pragmatics-base:latest (python + transformers)          │
+└──────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼ docker compose up --build
+┌──────────────────────────────────────────────────────────────────┐
+│  App Images (built locally on each code change, ~30 sec)        │
+│                                                                  │
+│  ├─ FROM jeeves-memory-base + COPY memory/*.py                   │
+│  ├─ FROM jeeves-extractor-base + COPY extractor/*.py             │
+│  └─ FROM jeeves-pragmatics-base + COPY pragmatics/*.py           │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-**When to rebuild base images:**
+### File Structure
 
-- After updating `requirements.txt`
-- After updating system dependencies in `Dockerfile.base`
-- First time setup on new machine
+```
+tools-api/
+├── memory/
+│   ├── Dockerfile          ← FROM jeeves-memory-base + app code
+│   ├── Dockerfile.base     ← System deps + pip (for maintainers)
+│   ├── requirements.txt    ← Python dependencies
+│   └── *.py                ← Application code
+├── extractor/
+│   ├── Dockerfile
+│   ├── Dockerfile.base
+│   └── ...
+└── pragmatics/
+    ├── Dockerfile
+    ├── Dockerfile.base
+    └── ...
+```
 
-**Regular development:** Just `docker compose up -d --build` (~10 seconds)
+### Why This Architecture?
+
+| Scenario          | Old (single Dockerfile) | New (base + app)             |
+| ----------------- | ----------------------- | ---------------------------- |
+| First build       | 35 min                  | 35 min (base) + 30 sec (app) |
+| Code change       | 2 sec (cached)          | 30 sec                       |
+| New machine       | 35 min                  | 30 sec (pulls from Hub)      |
+| Team member clone | 35 min                  | 30 sec                       |
+| CI/CD pipeline    | 35 min                  | 30 sec                       |
+
+**Regular development:** Just `docker compose up -d --build` (~30 seconds)
 
 ## Environment Variables
 
@@ -149,18 +189,34 @@ Invoke-RestMethod -Method Post `
 ## Project Structure
 
 ```
-tools-api/
-├── <tool>/
-│   ├── main.py                 # FastAPI entry point
-│   ├── filter.py               # Open-WebUI filter plugin
-│   ├── api/                    # REST endpoints (search/save with score gap filter)
-│   ├── services/               # Service layer
-│   ├── utils/                  # Shared logic
-│   └── static/
-│       ├── ai-plugin.json      # Plugin manifest
-│       └── openapi.yaml        # API spec
-├── <tool 2>/
-│   ├── ...
+jeeves/
+├── docker-compose.yaml      # Full stack definition
+├── build-base-images.ps1    # Script to build/push base images
+├── .env                     # Registry config (BASE_REGISTRY=...)
+├── ARCHITECTURE.md          # Detailed technical docs
+└── tools-api/
+    ├── memory/
+    │   ├── main.py          # FastAPI entry point
+    │   ├── memory.filter.py # Open-WebUI filter plugin
+    │   ├── api/memory.py    # REST endpoints
+    │   ├── services/        # Embedder, Qdrant, Summarizer
+    │   ├── Dockerfile       # App image (FROM base)
+    │   ├── Dockerfile.base  # Base image (deps + pip)
+    │   └── requirements.txt
+    ├── extractor/
+    │   ├── main.py          # FastAPI with model preloading
+    │   ├── api/extractor.py # /extract endpoint
+    │   ├── services/        # Image, Audio, PDF extractors
+    │   ├── Dockerfile
+    │   ├── Dockerfile.base
+    │   └── requirements.txt
+    └── pragmatics/
+        ├── server.py        # FastAPI classifier service
+        ├── services/        # DistilBERT classifier
+        ├── static/          # Trained model weights
+        ├── Dockerfile
+        ├── Dockerfile.base
+        └── requirements.txt
 ```
 
 ## Filter Plugin
