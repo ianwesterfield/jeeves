@@ -20,7 +20,7 @@ from typing import Dict, Any, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from services.classifier import classify_intent, classify_intent_multiclass
+from services.classifier import classify_intent, classify_intent_multiclass, classify_with_context
 
 
 # ============================================================================
@@ -134,6 +134,54 @@ async def classify_binary(request: ClassifyRequest) -> ClassifyResponse:
     
     except Exception as exc:
         logger.error(f"[classify-binary] Error: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class ContextClassifyRequest(BaseModel):
+    """Request to classify user text with conversation context."""
+    text: str = Field(..., min_length=1, max_length=5000)
+    context: str = Field("", max_length=2000, description="Recent conversation context (e.g., last assistant message)")
+
+
+@app.post("/api/pragmatics/classify-with-context", response_model=IntentResponse)
+async def classify_with_conversation_context(request: ContextClassifyRequest) -> IntentResponse:
+    """
+    Classify user intent with conversation context.
+    
+    This endpoint helps disambiguate short follow-up responses like:
+    - "yes" / "ok" / "go ahead" (affirmative continuations)
+    - "do it" / "make that change" (action confirmations)
+    - "can you change that?" (follow-up action requests)
+    
+    By providing the last assistant message as context, the classifier
+    can better determine if these are task continuations.
+    
+    Args:
+        text: Current user message
+        context: Recent assistant message (what the user is responding to)
+    
+    Returns the most likely intent and confidence score.
+    """
+    start_time = time.time()
+    text_preview = request.text[:50] if len(request.text) > 50 else request.text
+    
+    try:
+        result = classify_with_context(request.text, request.context)
+        duration_ms = int((time.time() - start_time) * 1000)
+        
+        logger.info(
+            f"[classify-ctx] intent={result['intent']} conf={result['confidence']:.2f} "
+            f"ms={duration_ms} text='{text_preview}'"
+        )
+        
+        return IntentResponse(
+            intent=result["intent"],
+            confidence=round(result["confidence"], 4),
+            all_probs={k: round(v, 4) for k, v in result["all_probs"].items()},
+        )
+    
+    except Exception as exc:
+        logger.error(f"[classify-ctx] Error: {exc} | text: {text_preview}")
         raise HTTPException(status_code=500, detail=str(exc))
 
 

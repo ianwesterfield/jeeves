@@ -113,6 +113,8 @@ class Step(BaseModel):
 class StepResult(BaseModel):
     """Result of executing a single step."""
     step_id: str
+    tool: Optional[str] = None  # Tool that was executed
+    params: Optional[Dict[str, Any]] = None  # Params used (excluding large content)
     status: StepStatus
     output: Optional[str] = None
     error: Optional[str] = None

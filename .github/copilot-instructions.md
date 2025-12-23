@@ -56,8 +56,11 @@ jeeves/
 ### Orchestrator Service (layers/orchestrator/)
 
 - **FastAPI app:** `main.py` on port 8004
+- **Model:** Devstral-Small-2:24B via Ollama (env: `OLLAMA_MODEL`)
 - **Router:** `api/orchestrator.py` - set-workspace, next-step, execute-batch
 - **Services:** reasoning_engine.py, task_planner.py, parallel_executor.py, memory_connector.py
+- **Feedback Loop:** Filter passes step history back to orchestrator for multi-step reasoning
+- **Max Steps:** 10 iterations before forced completion
 
 ### Executor Service (layers/executor/)
 

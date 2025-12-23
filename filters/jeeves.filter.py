@@ -1,4 +1,5 @@
-﻿"""
+# Awesome Task
+"""
 Jeeves Filter - Agentic Reasoning & Memory Integration
 
 Open-WebUI filter that provides:
@@ -116,6 +117,64 @@ def _classify_intent(text: str) -> Dict[str, Any]:
     return {"intent": "casual", "confidence": 0.3}
 
 
+def _detect_task_continuation(user_text: str, messages: List[dict], confidence: float) -> bool:
+    """
+    Detect if a 'casual' response is actually continuing a task.
+    
+    Uses pragmatics context-aware classification to determine if short
+    responses like "yes", "ok", "do it" are task continuations.
+    
+    Args:
+        user_text: Current user message
+        messages: Conversation history
+        confidence: Initial classification confidence
+    
+    Returns True if we should upgrade intent to 'task'.
+    """
+    # Get recent assistant message for context
+    context = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "assistant":
+            content = msg.get("content", "")
+            if isinstance(content, str) and content.strip():
+                # Take last ~500 chars of assistant message as context
+                context = content[-500:] if len(content) > 500 else content
+                break
+    
+    # If no context, can't determine continuation
+    if not context:
+        print(f"[jeeves] Task continuation: no assistant context")
+        return False
+    
+    # Call pragmatics context-aware endpoint
+    try:
+        resp = requests.post(
+            f"{PRAGMATICS_API_URL}/api/pragmatics/classify-with-context",
+            json={"text": user_text, "context": context},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            result = resp.json()
+            intent = result.get("intent", "casual")
+            ctx_confidence = result.get("confidence", 0.5)
+            
+            if intent == "task":
+                print(f"[jeeves] Task continuation: YES via pragmatics (conf={ctx_confidence:.2f})")
+                return True
+            else:
+                print(f"[jeeves] Task continuation: NO via pragmatics (intent={intent}, conf={ctx_confidence:.2f})")
+                return False
+    except Exception as e:
+        print(f"[jeeves] Task continuation: pragmatics error: {e}")
+    
+    # Fallback: low confidence + short message suggests continuation
+    if confidence < 0.7 and len(user_text.strip()) < 50:
+        print(f"[jeeves] Task continuation: MAYBE (low conf + short msg)")
+        return True
+    
+    return False
+
+
 # ============================================================================
 # Workspace Operations (Direct Execution)
 # ============================================================================
@@ -181,7 +240,7 @@ def _list_workspace_files(workspace_root: str, recursive: bool = True, max_depth
                         all_items = [(d, "dir") for d in dirs] + [(f, "file") for f in files]
                         all_items.sort(key=lambda x: x[0])
                         
-                        for path, item_type in all_items[:150]:
+                        for path, item_type in all_items[:500]:  # DEV MODE: Show more files
                             prefix = "📁 " if item_type == "dir" else "📄 "
                             # Add indentation based on depth
                             depth = path.count("/") + path.count("\\")
@@ -212,7 +271,7 @@ def _list_workspace_files(workspace_root: str, recursive: bool = True, max_depth
                 items = result.get("data", [])
                 if items:
                     lines = []
-                    for item in items[:100]:
+                    for item in items[:500]:  # DEV MODE: Show more files
                         prefix = "📁 " if item.get("type") == "dir" else "📄 "
                         lines.append(f"{prefix}{item.get('name', '?')}")
                     return "\n".join(lines)
@@ -223,7 +282,7 @@ def _list_workspace_files(workspace_root: str, recursive: bool = True, max_depth
     return None
 
 
-def _read_workspace_file(workspace_root: str, filepath: str, max_lines: int = 100) -> Optional[str]:
+def _read_workspace_file(workspace_root: str, filepath: str, max_lines: int = 500) -> Optional[str]:  # DEV MODE
     """
     Read a file from the workspace.
     
@@ -445,7 +504,7 @@ def _execute_tool(workspace_root: str, tool: str, params: dict) -> dict:
                     "workspace_root": "/workspace",  # Container mount point
                     "cwd": workspace_root,
                     "allow_file_write": True,
-                    "allow_shell_commands": False,
+                    "allow_shell_commands": True,  # Enable for git operations
                     "allowed_languages": ["python"],
                 },
             },
@@ -461,11 +520,74 @@ def _execute_tool(workspace_root: str, tool: str, params: dict) -> dict:
         return {"success": False, "output": None, "error": str(e)}
 
 
+# Maximum steps to prevent infinite loops
+# DEV MODE: Set high to allow complex multi-step tasks
+MAX_ORCHESTRATOR_STEPS = 100
+
+
+def _build_task_description(messages: List[dict]) -> str:
+    """
+    Build a complete task description from conversation context.
+    
+    For continuation requests like "Please do" or "yes", we need to include
+    the original task context from previous messages so the orchestrator
+    knows what to do.
+    """
+    user_text = _extract_user_text_prompt(messages) or ""
+    
+    # Check if this is a short continuation response
+    short_continuations = [
+        "please do", "yes", "yeah", "sure", "ok", "okay", "go ahead",
+        "do it", "proceed", "make the changes", "sounds good",
+        "that works", "perfect", "great", "continue", "next"
+    ]
+    
+    user_lower = user_text.lower().strip()
+    is_continuation = len(user_text) < 100 and any(
+        user_lower.startswith(cont) or user_lower == cont
+        for cont in short_continuations
+    )
+    
+    if not is_continuation:
+        return user_text
+    
+    # This is a continuation - find the original task from conversation history
+    # Look for the most recent substantial user message
+    for msg in reversed(messages[:-1]):  # Skip current message
+        if msg.get("role") != "user":
+            continue
+        
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            # Extract text from multi-part content
+            texts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+            content = " ".join(texts)
+        
+        if not isinstance(content, str):
+            continue
+            
+        # Skip short messages that are also continuations
+        if len(content) < 50:
+            continue
+            
+        # Skip messages that look like injected context
+        if content.startswith("### ") or "End Workspace Files" in content:
+            continue
+        
+        # Found the original task
+        print(f"[jeeves] Continuation detected - using original task: {content[:100]}...")
+        return f"User originally asked: {content}\n\nUser now confirms: {user_text}"
+    
+    # Fallback to current text if no original task found
+    return user_text
+
+
 async def _orchestrate_task(
     user_id: str,
     messages: List[dict],
     workspace_root: Optional[str],
     __event_emitter__,
+    memory_context: Optional[List[dict]] = None,
 ) -> Optional[str]:
     """
     Handle task intents via orchestrator reasoning + executor.
@@ -474,14 +596,44 @@ async def _orchestrate_task(
       1. Send task to orchestrator for reasoning
       2. Orchestrator returns next step (tool + params)
       3. Execute step via executor
-      4. Return results
+      4. Feed results back to orchestrator
+      5. Repeat until tool="complete" or max steps reached
+    
+    Args:
+        memory_context: User context from memory (name, preferences, etc.)
     
     Returns context string to inject into conversation.
     """
-    user_text = _extract_user_text_prompt(messages) or ""
+    # Build complete task description (handles continuations)
+    user_text = _build_task_description(messages)
+    
+    # Pass memory context to orchestrator - prefer structured facts when available
+    if memory_context:
+        user_info = []
+        for item in memory_context[:3]:
+            # Check for extracted facts first (structured data)
+            facts = item.get('facts')
+            if facts and isinstance(facts, dict):
+                for fact_type, fact_value in facts.items():
+                    # Format as clear key: value for LLM
+                    user_info.append(f"{fact_type}: {fact_value}")
+            else:
+                # Fall back to raw text
+                text = item.get('user_text', '')
+                if text:
+                    user_info.append(text)
+        
+        if user_info:
+            # Prepend user info to task for LLM to reference
+            info_block = "\n".join(f"- {info}" for info in user_info)
+            user_text = f"User information from memory:\n{info_block}\n\nTask: {user_text}"
     
     if not workspace_root:
         return None
+    
+    # Track step history for feedback loop
+    step_history: List[dict] = []
+    all_results: List[str] = []
     
     try:
         # Set workspace context
@@ -496,90 +648,136 @@ async def _orchestrate_task(
             timeout=10,
         )
         
-        # Get next step from orchestrator
-        resp = requests.post(
-            f"{ORCHESTRATOR_API_URL}/api/orchestrate/next-step",
-            json={
-                "task": user_text,
-                "user_id": user_id,
-                "conversation_history": messages[-10:],
-            },
-            timeout=120,  # Allow time for LLM reasoning
-        )
-        
-        if resp.status_code != 200:
-            print(f"[jeeves] Orchestrator returned {resp.status_code}")
-            return None
-        
-        step = resp.json()
-        tool = step.get("tool", "complete")
-        params = step.get("params", {})
-        reasoning = step.get("reasoning", "")
-        
-        await __event_emitter__({
-            "type": "status",
-            "data": {"description": f"✨ {reasoning[:60]}", "done": False, "hidden": False}
-        })
-        
-        # Handle completion (no action needed)
-        if tool == "complete":
-            if params.get("error"):
-                return f"""### Orchestrator Error ###
+        # Multi-step execution loop
+        for step_num in range(1, MAX_ORCHESTRATOR_STEPS + 1):
+            # Get next step from orchestrator (with history feedback)
+            resp = requests.post(
+                f"{ORCHESTRATOR_API_URL}/api/orchestrate/next-step",
+                json={
+                    "task": user_text,
+                    "user_id": user_id,
+                    "history": step_history,  # Feedback: previous step results
+                    "conversation_history": messages[-10:],
+                },
+                timeout=300,  # DEV MODE: Extended LLM reasoning time
+            )
+            
+            if resp.status_code != 200:
+                print(f"[jeeves] Orchestrator returned {resp.status_code}")
+                break
+            
+            step = resp.json()
+            tool = step.get("tool", "complete")
+            params = step.get("params", {})
+            reasoning = step.get("reasoning", "")
+            
+            # Handle completion - no summary needed, just break
+            if tool == "complete":
+                if params.get("error"):
+                    all_results.append(f"""### Orchestrator Error ###
 {params.get('error')}
 ### End Error ###
-
-"""
-            return None  # Task complete, let LLM respond naturally
-        
-        # Execute the planned step
-        # Format status based on tool type
-        tool_path = params.get("path", "")
-        if tool == "scan_workspace":
-            status_msg = f"🔍 Scanning {tool_path or 'workspace'}..."
-        elif tool == "read_file":
-            status_msg = f"📖 Reading {tool_path}..."
-        elif tool in ("write_file", "replace_in_file", "insert_in_file", "append_to_file"):
-            status_msg = f"✏️ Editing {tool_path}..."
-        elif tool == "execute_code":
-            status_msg = f"⚙️ Running code..."
-        else:
-            status_msg = f"⚡ {tool}..."
-        
-        await __event_emitter__({
-            "type": "status",
-            "data": {"description": status_msg, "done": False, "hidden": False}
-        })
-        
-        result = _execute_tool(workspace_root, tool, params)
-        
-        success = result.get("success", False)
-        output = result.get("output")
-        error = result.get("error")
-        
-        if success:
-            # Clean completion message
+""")
+                # Break out of loop - task complete
+                break
+            
+            # Count edits for progress display (before executing)
+            edit_tools = ("write_file", "replace_in_file", "insert_in_file", "append_to_file")
+            edit_count = sum(1 for h in step_history if h["tool"] in edit_tools and h["status"] == "success")
+            
+            # Track logical steps (not individual file operations)
+            # A logical step is: scan, read, code execution, or an edit BATCH (not each file)
+            is_first_edit_in_batch = tool in edit_tools and edit_count == 0
+            is_continuation_edit = tool in edit_tools and edit_count > 0
+            
+            # Extract total from reasoning if available (e.g., "Editing file 1/64")
+            import re
+            total_match = re.search(r'/(\d+)', reasoning)
+            total_files = int(total_match.group(1)) if total_match else None
+            
+            # Build short path for display
+            tool_path = params.get("path", "")
+            short_path = tool_path.split("/")[-1].split("\\")[-1] if tool_path else ""
+            
+            # Natural conversational status: ✨ {reason}, I'm {verb}ing 🔍 {target}
+            # Truncate reasoning for status display (first ~40 chars)
+            reasoning_snippet = reasoning[:40] + "..." if len(reasoning) > 40 else reasoning
+            
             if tool == "scan_workspace":
-                done_msg = "✅ Scan complete"
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": f"✨ {reasoning_snippet}, scanning 🔍 {short_path or 'the workspace'}", "done": False, "hidden": False}
+                })
             elif tool == "read_file":
-                done_msg = "✅ File loaded"
-            elif tool in ("write_file", "replace_in_file", "insert_in_file", "append_to_file"):
-                done_msg = "✅ File updated"
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": f"✨ {reasoning_snippet}, reading 📖 {short_path}", "done": False, "hidden": False}
+                })
+            elif tool in edit_tools:
+                # BATCH MODE: Only show status on first edit, not every file
+                if is_first_edit_in_batch:
+                    if total_files:
+                        await __event_emitter__({
+                            "type": "status",
+                            "data": {"description": f"✨ Editing ✏️ {total_files} files...", "done": False, "hidden": False}
+                        })
+                    else:
+                        await __event_emitter__({
+                            "type": "status",
+                            "data": {"description": f"✨ {reasoning_snippet}, editing ✏️ {short_path}", "done": False, "hidden": False}
+                        })
+                # Silent for subsequent edits in batch
             elif tool == "execute_code":
-                done_msg = "✅ Code executed"
+                lang = params.get("language", "code")
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": f"✨ {reasoning_snippet}, running ⚙️ {lang}", "done": False, "hidden": False}
+                })
+            elif tool == "execute_shell":
+                cmd = params.get("command", "")[:30]
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": f"✨ {reasoning_snippet}, running 🖥️ {cmd}...", "done": False, "hidden": False}
+                })
             else:
-                done_msg = "✅ Done"
+                # Other tools - show reasoning
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": f"✨ {reasoning_snippet}", "done": False, "hidden": False}
+                })
             
-            await __event_emitter__({
-                "type": "status",
-                "data": {"description": done_msg, "done": True, "hidden": False}
-            })
+            result = _execute_tool(workspace_root, tool, params)
             
-            # Format output based on tool type
-            if tool == "scan_workspace":
-                # Executor now returns pretty-formatted string directly
-                formatted = output if output else "(no files found)"
-                
-                return f"""### Workspace Files ###
+            success = result.get("success", False)
+            output = result.get("output")
+            error = result.get("error")
+            
+            # Only show errors - success is silent
+            if not success:
+                error_snippet = (error[:40] + "...") if error and len(error) > 40 else (error or "unknown")
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": f"⚠️ Failed: {error_snippet}", "done": False, "hidden": False}
+                })
+            
+            # Record step result for feedback to orchestrator
+            # Include tool name so orchestrator knows what was already done
+            step_result = {
+                "step_id": f"step_{step_num}",
+                "tool": tool,
+                "params": {k: v for k, v in params.items() if k != "content"},  # Exclude large content
+                "status": "success" if success else "failed",
+                "output": (output[:10000] if output else None),  # DEV MODE: Large context
+                "error": error,
+            }
+            step_history.append(step_result)
+            
+            # Format result for context injection
+            if success:
+                # Format output based on tool type
+                if tool == "scan_workspace":
+                    formatted = output if output else "(no files found)"
+                    all_results.append(f"""### Workspace Files ###
 **Reasoning:** {reasoning}
 
 The following is a unified listing (directories and files together, sorted alphabetically with directories first). Present this table as-is without splitting into separate sections:
@@ -589,35 +787,36 @@ The following is a unified listing (directories and files together, sorted alpha
 ```
 
 ### End Workspace Files ###
-
-"""
-            
-            elif tool == "read_file":
-                path = params.get("path", "file")
-                return f"""### File Content: {path} ###
+""")
+                
+                elif tool == "read_file":
+                    path = params.get("path", "file")
+                    all_results.append(f"""### File Content: {path} ###
 **Reasoning:** {reasoning}
 
 ```
 {output or "(empty)"}
 ```
 ### End File Content ###
-
-"""
-            
-            elif tool in ("write_file", "append_to_file", "replace_in_file", "insert_in_file"):
-                path = params.get("path", "file")
-                return f"""### File Operation Result ###
+""")
+                
+                elif tool in ("write_file", "append_to_file", "replace_in_file", "insert_in_file"):
+                    path = params.get("path", "file")
+                    # Include snippet of actual content for accurate summarization
+                    # Different tools use different param names for content
+                    content = params.get("content") or params.get("text") or params.get("new_text") or ""
+                    content_snippet = content[:100] + "..." if len(content) > 100 else content
+                    all_results.append(f"""### File Operation Result ###
 **Operation:** {tool} on {path}
 **Status:** ✅ Success
-**Reasoning:** {reasoning}
+**Content added:** `{content_snippet}`
 **Result:** {output or "OK"}
 ### End File Operation ###
-
-"""
-            
-            elif tool == "execute_code":
-                lang = params.get("language", "code")
-                return f"""### Code Execution Result ###
+""")
+                
+                elif tool == "execute_code":
+                    lang = params.get("language", "code")
+                    all_results.append(f"""### Code Execution Result ###
 **Language:** {lang}
 **Reasoning:** {reasoning}
 
@@ -625,34 +824,68 @@ The following is a unified listing (directories and files together, sorted alpha
 {output or "(no output)"}
 ```
 ### End Code Execution ###
-
-"""
-            
-            else:
-                # Generic output
-                return f"""### {tool} Result ###
+""")
+                
+                elif tool == "execute_shell":
+                    cmd = params.get("command", "")
+                    all_results.append(f"""### Shell Command Result ###
+**Command:** `{cmd}`
+**Status:** ✅ Success
+**Output:** {output or "(no output)"}
+### End Shell Command ###
+""")
+                
+                else:
+                    all_results.append(f"""### {tool} Result ###
 **Reasoning:** {reasoning}
 
 ```
 {output or "(no output)"}
 ```
 ### End Result ###
-
-"""
-        
-        else:
-            await __event_emitter__({
-                "type": "status",
-                "data": {"description": "❌ Operation failed", "done": True, "hidden": False}
-            })
+""")
             
-            return f"""### Execution Error ###
+            else:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": f"⚠️ Step {step_num} failed, adjusting...", "done": False, "hidden": False}
+                })
+                
+                all_results.append(f"""### Step {step_num} Error ###
 **Tool:** {tool}
 **Reasoning:** {reasoning}
 **Error:** {error or "Unknown error"}
 ### End Error ###
-
+""")
+                
+                # Don't break on error - let orchestrator decide how to recover
+        
+        # Final status already shown at completion - just mark done
+        await __event_emitter__({
+            "type": "status",
+            "data": {"description": "✅ Ready", "done": True, "hidden": False}
+        })
+        
+        # Return all accumulated results with clear COMPLETED header
+        if all_results:
+            # Count successful operations for summary
+            file_ops = sum(1 for r in all_results if "File Operation Result" in r)
+            
+            header = """### TASK ALREADY COMPLETED ###
+**CRITICAL:** The actions below have ALREADY been executed. Do NOT hallucinate details.
+- Speak in PAST TENSE: "I added...", "I updated..."
+- Report EXACTLY what the logs show - do NOT invent content or formats
+- The "Content added" field shows the EXACT text that was written
 """
+            if file_ops > 0:
+                header += f"**Files modified:** {file_ops}\n"
+            header += "### Action Log ###\n"
+            
+            footer = """### End Action Log ###
+Give a brief summary. Quote the EXACT content from the logs, do not paraphrase or embellish.
+"""
+            return header + "\n".join(all_results) + footer
+        return None
         
     except Exception as e:
         print(f"[jeeves] Orchestrator error: {e}")
@@ -1180,54 +1413,47 @@ class Filter:
             orchestrator_context = None
             intent_result = {"intent": "casual", "confidence": 0.5}
             
+            # Search memory FIRST - we need user context (name, etc.) for tasks
+            status = "skipped"
+            context = []
+            source_type = "document" if chunks else "prompt"
+            
+            if chunks:
+                source_name = filenames[0] if filenames else "attachment"
+            else:
+                content = messages[-1].get("content", "") if messages else ""
+                source_name = (
+                    (str(content)[:50] + "...") if len(str(content)) > 50 else str(content)
+                )
+            
+            status, context = await _search_memory(
+                user_id, messages, model, metadata, source_type, source_name
+            )
+            
             if user_text:
                 intent_result = _classify_intent(user_text)
                 intent = intent_result.get("intent", "casual")
                 confidence = intent_result.get("confidence", 0.5)
                 
-                # Don't show intent classification to user - just continue thinking
-                pass  # Intent classified internally
+                # SMART TASK CONTINUATION DETECTION
+                # Check if user is confirming/continuing a previous task proposal
+                if intent == "casual":
+                    should_upgrade = _detect_task_continuation(user_text, messages, confidence)
+                    if should_upgrade:
+                        print(f"[jeeves] Upgrading intent from casual to task (continuation detected)")
+                        intent = "task"
                 
-                # For task intents, engage orchestrator
+                # For task intents, engage orchestrator (pass memory context for user info)
                 if intent == "task" and self.user_valves.enable_orchestrator:
                     orchestrator_context = await _orchestrate_task(
                         user_id,
                         messages,
                         self.user_valves.workspace_root if self.user_valves.workspace_root else None,
                         __event_emitter__,
+                        memory_context=context,  # Pass user context (name, preferences)
                     )
             
-            # Skip memory operations for file/workspace tasks
-            # These are operational commands, not info to remember
-            is_file_operation = orchestrator_context and any(
-                marker in orchestrator_context for marker in [
-                    "### Workspace Files ###",
-                    "### File Content ###", 
-                    "### File Operation Result ###",
-                    "### Workspace Error ###",
-                ]
-            )
-            
-            # Search memory (skip for file operations)
-            status = "skipped"
-            context = []
-            
-            if not is_file_operation:
-                source_type = "document" if chunks else "prompt"
-                
-                if chunks:
-                    source_name = filenames[0] if filenames else "attachment"
-                else:
-                    content = messages[-1].get("content", "") if messages else ""
-                    source_name = (
-                        (str(content)[:50] + "...") if len(str(content)) > 50 else str(content)
-                    )
-                
-                status, context = await _search_memory(
-                    user_id, messages, model, metadata, source_type, source_name
-                )
-            
-            # Merge immediate image context
+            # Merge immediate image context (memory already searched above)
             if immediate_image_context:
                 context = immediate_image_context + context
                 if status == "skipped":
@@ -1318,14 +1544,34 @@ class Filter:
         """
         Format response text for better markdown rendering.
         
+        - Remove leaked tool call syntax (LLM hallucinations)
         - Wrap file/folder names in backticks
         - Wrap code references in backticks
         - Ensure code blocks are fenced
         """
         import re
         
-        # Skip if already well-formatted or empty
-        if not text or text.startswith("```"):
+        # Skip if empty
+        if not text:
+            return text
+        
+        # SANITIZATION: Remove any leaked tool call syntax
+        # Some models output [TOOL_CALLS] when they shouldn't
+        tool_call_pattern = r'\[TOOL_CALLS\][^\[]*(?:\[ARGS\][^\[]*)?'
+        if '[TOOL_CALLS]' in text:
+            text = re.sub(tool_call_pattern, '', text)
+            # Clean up any orphaned text that looks like tool calls
+            text = re.sub(r'\{"file_path":\s*"[^"]*"\}', '', text)
+            text = re.sub(r'\{"path":\s*"[^"]*"\}', '', text)
+            # Remove multiple newlines created by cleanup
+            text = re.sub(r'\n{3,}', '\n\n', text)
+            text = text.strip()
+            # If we removed everything, provide a fallback
+            if not text or len(text) < 20:
+                text = "I'll help you with that task. Let me process the files in your workspace."
+        
+        # Skip further formatting if already well-formatted
+        if text.startswith("```"):
             return text
         
         # Pattern for file paths and names (with extensions or path separators)

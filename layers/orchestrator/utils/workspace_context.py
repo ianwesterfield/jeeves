@@ -84,13 +84,13 @@ class WorkspaceContextManager:
             cwd=str(cwd_path),
             workspace_root=str(root_path),
             available_paths=available_paths,
-            parallel_enabled=permissions.get("parallel_enabled", False),
-            max_parallel_tasks=permissions.get("max_parallel_tasks", 4),
+            parallel_enabled=permissions.get("parallel_enabled", True),  # DEV MODE: Enable by default
+            max_parallel_tasks=permissions.get("max_parallel_tasks", 10),  # DEV MODE: Higher default
             allowed_languages=permissions.get("allowed_languages", ["python", "powershell", "node"]),
-            allow_code_execution=permissions.get("allow_code_execution", False),
-            allow_file_write=permissions.get("allow_file_write", False),
-            allow_shell_commands=permissions.get("allow_shell_commands", False),
-            max_execution_time=permissions.get("max_execution_time", 30),
+            allow_code_execution=permissions.get("allow_code_execution", True),  # DEV MODE: Enable by default
+            allow_file_write=permissions.get("allow_file_write", True),  # DEV MODE: Enable by default
+            allow_shell_commands=permissions.get("allow_shell_commands", True),  # DEV MODE: Enable by default
+            max_execution_time=permissions.get("max_execution_time", 120),  # DEV MODE: Higher default
         )
         
         # Cache context
@@ -102,8 +102,8 @@ class WorkspaceContextManager:
     async def _list_directory(
         self,
         path: Path,
-        max_depth: int = 2,
-        max_files: int = 100,
+        max_depth: int = 5,    # DEV MODE: Deeper traversal
+        max_files: int = 500,  # DEV MODE: More files
     ) -> List[str]:
         """
         List directory contents up to a certain depth.

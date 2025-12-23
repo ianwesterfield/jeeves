@@ -153,6 +153,101 @@ def classify_intent_multiclass(text: str) -> Dict[str, Any]:
 
 
 # ============================================================================
+# Context-Aware Classification
+# ============================================================================
+
+# Short affirmative patterns that typically continue tasks
+AFFIRMATIVE_PATTERNS = {
+    "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "go ahead", "do it",
+    "please do", "proceed", "make it so", "sounds good", "that works",
+    "perfect", "great", "go for it", "let's do it", "continue", "next",
+    "all of them", "all", "both", "1", "2", "3", "commit", "save",
+    "apply", "yes please", "yes go ahead", "ok do it", "sure thing",
+}
+
+# Context patterns that indicate assistant proposed an action
+TASK_PROPOSAL_PATTERNS = [
+    "would you like me to", "should i ", "do you want me to",
+    "i can ", "i could ", "i'll ", "let me know if",
+    "shall i", "want me to", "ready to", "proceed with",
+    "here's the plan", "the changes would be",
+    "files that need", "files to update", "files found",
+    "which option", "option 1", "option 2", "choose",
+    "select", "pick", "apply the", "make the change",
+    "update the", "fix the", "create the", "delete the",
+]
+
+
+def classify_with_context(user_text: str, context: str = "") -> Dict[str, Any]:
+    """
+    Classify intent with conversation context.
+    
+    Uses a two-phase approach:
+    1. Check if user message is a short affirmative AND context contains task proposal
+    2. Fall back to ML classification if not
+    
+    Args:
+        user_text: Current user message
+        context: Recent conversation context (e.g., last assistant message)
+    
+    Returns:
+        Same format as classify_intent_multiclass
+    """
+    # First, classify the user text alone
+    standalone_result = classify_intent_multiclass(user_text)
+    
+    # If already high-confidence task, return immediately
+    if standalone_result["intent"] == "task" and standalone_result["confidence"] >= 0.75:
+        return standalone_result
+    
+    # If no context provided, return standalone result
+    if not context or not context.strip():
+        return standalone_result
+    
+    # Check for affirmative continuation pattern
+    user_lower = user_text.lower().strip()
+    context_lower = context.lower()
+    
+    # Is user message a short affirmative?
+    is_short = len(user_text.strip()) < 50
+    is_affirmative = any(
+        user_lower == pattern or 
+        user_lower.startswith(pattern + " ") or
+        user_lower.startswith(pattern + ",") or
+        user_lower.startswith(pattern + ".")
+        for pattern in AFFIRMATIVE_PATTERNS
+    )
+    
+    # Does context contain task proposal?
+    has_task_proposal = any(pattern in context_lower for pattern in TASK_PROPOSAL_PATTERNS)
+    
+    # Upgrade to task if affirmative response to task proposal
+    if is_short and is_affirmative and has_task_proposal:
+        logger.info(
+            f"[classify] Context upgrade: affirmative '{user_text[:30]}' + task proposal -> task"
+        )
+        return {
+            "intent": "task",
+            "confidence": 0.85,  # High confidence for clear pattern match
+            "all_probs": {"task": 0.85, "casual": 0.10, "save": 0.025, "recall": 0.025},
+        }
+    
+    # Check for follow-up action request pattern
+    action_starters = ["can you", "could you", "would you", "please", "go through"]
+    is_action_request = any(user_lower.startswith(starter) for starter in action_starters)
+    
+    if is_action_request:
+        logger.info(f"[classify] Context upgrade: action request '{user_text[:30]}' -> task")
+        return {
+            "intent": "task",
+            "confidence": 0.80,
+            "all_probs": {"task": 0.80, "casual": 0.15, "save": 0.025, "recall": 0.025},
+        }
+    
+    return standalone_result
+
+
+# ============================================================================
 # Public API - Binary (backward compatible)
 # ============================================================================
 

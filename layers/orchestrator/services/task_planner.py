@@ -55,11 +55,12 @@ class TaskPlanner:
         matching_files = glob.glob(search_pattern, recursive=True)
         
         # Limit batch size for safety
-        max_batch_size = 20
+        # DEV MODE: Higher limit for testing
+        max_batch_size = 100
         if workspace_context:
             max_batch_size = min(
-                workspace_context.max_parallel_tasks * 5,
-                100  # Hard limit
+                workspace_context.max_parallel_tasks * 10,
+                500  # DEV MODE: Higher hard limit
             )
         
         if len(matching_files) > max_batch_size:

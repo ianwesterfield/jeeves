@@ -58,18 +58,30 @@ The main entry point running inside Open-WebUI.
 - Classify user intent via Pragmatics API
 - Delegate all task intents to Orchestrator for reasoning
 - Execute tool calls via Executor API
+- **Feed results back to Orchestrator** for multi-step reasoning
 - Search memory for relevant context
 - Inject context and results into LLM conversation
 
-**Flow (Always Delegate):**
+**Flow (Multi-Step with Feedback Loop):**
 
 ```python
 1. Classify intent via Pragmatics API
-2. If task → Delegate to Orchestrator (no shortcuts)
-3. Orchestrator reasons and returns tool + params
-4. Execute tool via Executor API
-5. Inject formatted results into context
+2. If task → Delegate to Orchestrator
+3. LOOP (max 10 steps):
+   a. Orchestrator reasons with history → returns tool + params
+   b. Execute tool via Executor API
+   c. Record result in step_history
+   d. If tool == "complete" → break
+4. Inject all accumulated results into context
 ```
+
+**Key Feature: Feedback Loop**
+
+The filter tracks execution results and feeds them back to the orchestrator:
+
+- Orchestrator sees success/failure of each step
+- Can adjust strategy based on errors
+- Can gather information across multiple steps before acting
 
 **Status Icons:**
 
@@ -214,17 +226,47 @@ Media-to-text extraction (GPU-accelerated).
 
 ### 6. Orchestrator API (Port 8004)
 
-Multi-step reasoning and task planning.
+Multi-step reasoning and task planning using **Devstral-Small-2 (24B)**.
 
 **Endpoints:**
 
 ```
 POST /api/orchestrate/set-workspace   # Set workspace context
-POST /api/orchestrate/next-step       # Get next tool + params
+POST /api/orchestrate/next-step       # Get next tool + params (with history)
 POST /api/orchestrate/execute-batch   # Execute multiple steps
 ```
 
 **Role:** The Orchestrator is the "brain" that decides which tool to use. All task intents are delegated to it - there are no hardcoded patterns in the filter.
+
+**Model Choice: Devstral-Small-2:24B**
+
+Selected for agentic reasoning because:
+
+- Designed for agentic coding tasks
+- Strong multi-step reasoning capability
+- Excellent JSON output formatting
+- 32K context window for history tracking
+- Good error recovery and adaptation
+
+**Feedback Loop:**
+
+The orchestrator receives step history with each request:
+
+```json
+{
+  "task": "user request",
+  "history": [
+    { "step_id": "step_1", "status": "success", "output": "..." },
+    { "step_id": "step_2", "status": "failed", "error": "..." }
+  ]
+}
+```
+
+This allows the model to:
+
+- Adapt strategy based on failures
+- Use gathered information in subsequent steps
+- Know when to complete vs continue
 
 ---
 

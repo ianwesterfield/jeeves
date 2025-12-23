@@ -30,13 +30,12 @@ from urllib3.util.retry import Retry
 from fastapi import APIRouter, HTTPException
 from services.qdrant_client import _client, _ensure_collection
 from services.embedder import embed_messages, embed
-# Fact extractor disabled for now - was causing false positives
-# from services.fact_extractor import (
-#     extract_facts,
-#     extract_facts_from_document,
-#     format_facts_for_storage,
-#     facts_to_embedding_text,
-# )
+# Re-enabled fact extractor for entity extraction (names, etc.)
+from services.fact_extractor import (
+    extract_facts,
+    format_facts_for_storage,
+    facts_to_embedding_text,
+)
 from utils.schemas import SaveRequest, SearchRequest, MemoryResult
 from qdrant_client.http import models
 
@@ -362,12 +361,22 @@ def save_memory(req: SaveRequest) -> Dict[str, Any]:
     # Always save the new memory (even if similar context was found)
     content_hash = hashlib.md5(serialized_content.encode()).hexdigest()
     
-    # Build payload with full content
+    # Extract structured facts (names, dates, etc.) from user text
+    facts = extract_facts(user_text) if user_text else []
+    facts_text = facts_to_embedding_text(facts) if facts else None
+    
+    # Build payload with full content and extracted facts
     payload: Dict[str, Any] = {
         "user_id": req.user_id,
         "user_text": user_text,  # Keep for compatibility/search
         "full_content": serialized_content,  # New: full multi-modal content
     }
+    
+    # Add extracted facts if any
+    if facts:
+        payload["facts"] = format_facts_for_storage(facts)
+        payload["facts_text"] = facts_text
+        print(f"[/save] Extracted facts: {facts}")
     
     # Add source information
     if req.source_type:
