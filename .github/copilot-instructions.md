@@ -18,99 +18,112 @@ docker ps -a
 
 ## Big Picture
 
-- **Purpose:** FastAPI microservice that captures conversation "memories", embeds them with `sentence-transformers`, and stores/searches them in **Qdrant**. It exposes endpoints used by Open-WebUI via a filter plugin.
+- **Purpose:** Jeeves is an agentic assistant with semantic memory, intent classification, multi-step reasoning, and polyglot code execution.
 - **Key services:**
-  - `memory_api` (this app) on port `8000`.
-  - `qdrant` vector DB on `6333` (HTTP) and optional `5100` UI.
-- **Data flow:** Open‑WebUI → `Filter.inlet` (`app/memory.filter.py`) → POST `/api/memory/save` → embed → Qdrant upsert → optional similar-context search → response includes `existing_context` injected into the next model call.
+  - `jeeves` on port `8000` - agent core + semantic memory (filter endpoint: `/api/agent`)
+  - `pragmatics_api` on port `8001` - intent classification
+  - `extractor_api` on port `8002` - document/image/audio extraction
+  - `orchestrator_api` on port `8004` - multi-step reasoning engine
+  - `executor_api` on port `8005` - polyglot code execution
+  - `qdrant` vector DB on `6333` (HTTP) and `5100` (UI)
+  - `ollama` on port `11434` - local LLM inference
+- **Data flow:** Open‑WebUI → `jeeves.filter.py` → classify intent → orchestrate if task → search/save memory → inject context
 
 ## Where Things Live
 
-### Memory Service
+### Directory Structure
 
-- **FastAPI app:** `docker/tools-api/app/main.py` mounts static plugin at `/.well-known` and includes router at `/api/memory`.
-- **Router:** `docker/tools-api/app/api/memory.py` implements `/save` and `/search`.
-- **Embeddings:** `docker/tools-api/app/services/embedder.py` uses `SentenceTransformer("all-mpnet-base-v2")`, normalized, 768‑dim.
-- **Qdrant client:** `docker/tools-api/app/services/qdrant_client.py` lazy singleton; collection created as needed (COSINE, size 768).
-- **Schemas:** `docker/tools-api/app/utils/schemas.py` (`Message`, `SaveRequest`, `SearchRequest`, `MemoryResult`).
-- **Open‑WebUI Filter:** `docker/tools-api/app/memory.filter.py` sends to `http://memory_api:8000/api/memory/save` and injects context.
-- **Plugin files:** `docker/tools-api/app/static/` contains `ai-plugin.json` and `openapi.yaml` served under `/.well-known`.
+```
+jeeves/
+├── filters/
+│   └── jeeves.filter.py      # Main Open-WebUI filter (mounted read-only)
+├── layers/
+│   ├── memory/               # Semantic memory service (port 8000)
+│   ├── pragmatics/           # Intent classification (port 8001)
+│   ├── extractor/            # Media extraction (port 8002)
+│   ├── orchestrator/         # Reasoning engine (port 8004)
+│   └── executor/             # Code execution (port 8005)
+└── docker-compose.yaml
+```
 
-### Extractor Service (Image/Audio/PDF)
+### Memory Service (layers/memory/)
 
-- **Extractor app:** `tools-api/extractor/main.py` FastAPI server on port `8002`.
-- **Router:** `tools-api/extractor/api/extractor.py` implements `/extract` endpoint (accepts base64-encoded content).
-- **Image extraction:** `tools-api/extractor/services/image_extractor.py` uses **LLaVA-1.5-7B** (4-bit quantized, ~4GB VRAM) or Florence-2 fallback. Model selected via `IMAGE_MODEL` env var (`llava-4bit`, `llava`, or `florence`). **Note:** Model loads lazily on first request and persists for container lifetime.
-- **Audio extraction:** `tools-api/extractor/services/audio_extractor.py` uses Whisper for transcription.
-- **PDF extraction:** `tools-api/extractor/services/pdf_extractor.py` uses PyMuPDF.
-- **Text chunking:** `tools-api/extractor/services/chunker.py` handles text/markdown segmentation.
+- **FastAPI app:** `main.py` serves filter at `/api/jeeves/filter`
+- **Router:** `api/memory.py` implements `/save` and `/search`
+- **Embeddings:** `services/embedder.py` uses `SentenceTransformer("all-mpnet-base-v2")`, 768-dim
+- **Qdrant client:** `services/qdrant_client.py` lazy singleton
+
+### Orchestrator Service (layers/orchestrator/)
+
+- **FastAPI app:** `main.py` on port 8004
+- **Router:** `api/orchestrator.py` - set-workspace, next-step, execute-batch
+- **Services:** reasoning_engine.py, task_planner.py, parallel_executor.py, memory_connector.py
+
+### Executor Service (layers/executor/)
+
+- **FastAPI app:** `main.py` on port 8005
+- **Router:** `api/executor.py` - tool, code, shell, file endpoints
+- **Services:** polyglot_handler.py (Python/PowerShell/Node), shell_handler.py, file_handler.py
+
+### Extractor Service (layers/extractor/)
+
+- **Image extraction:** Uses LLaVA-1.5-7B (4-bit) or Florence-2 fallback
+- **Audio extraction:** Whisper for transcription
+- **PDF extraction:** PyMuPDF
 
 ## Conventions & Patterns
 
+### Jeeves Filter (filters/jeeves.filter.py)
+
+- **Intent classification:** Uses pragmatics_api or falls back to regex heuristics
+- **Orchestrator integration:** For task intents, engages orchestrator for multi-step planning
+- **Memory operations:** Saves documents/images, searches for relevant context
+- **Context injection:** Prepends memories and analysis to user message
+
 ### Memory Service
 
-- **Message content:** `content` may be `str` or `List[dict]` with items like `{type: "text", text: "..."}` or `{type: "image_url", ...}`. Embedding extracts text and tags images as `[image]`.
-- **Deterministic IDs:** Points use `_make_uuid(user_id, content_hash)` producing 64‑bit int for Qdrant `id`.
-- **Importance gating:** `_is_worth_saving(messages)` uses **KeyBERT** (`all-mpnet-base-v2`) and heuristics to skip casual/musing queries (e.g., "just curious"). It saves only when strong keywords or anchor terms (names, dates, contacts) are present.
-- **Search first, save always (if worth):** `/save` runs REST search against Qdrant for existing context, then upserts current memory if worth saving. If context exists, `status` becomes `saved_with_context`.
-- **Direct Qdrant REST for search:** Although the Python client exists, searches in `memory.py` use `requests` against Qdrant HTTP API for speed/control. Results are limited and gated by a high `score_threshold` to avoid injecting unrelated context.
-- **CORS/Static:** `main.py` whitelists common local origins, and mounts plugin files at `/.well-known`.
+- **Message content:** `content` may be `str` or `List[dict]` with items like `{type: "text", text: "..."}` or `{type: "image_url", ...}`
+- **Deterministic IDs:** Points use `_make_uuid(user_id, content_hash)` producing 64‑bit int
+- **Importance gating:** `_is_worth_saving(messages)` uses KeyBERT to skip casual queries
 
 ### Extractor Service
 
-- **Image model routing:** `image_extractor.py` checks `_model_type in ("llava", "llava-4bit")` to route to `_generate_llava()`, else falls back to `_generate_florence()`. **Bug fix (2025-12-19):** Ensured both "llava" and "llava-4bit" are routed correctly; previously only "llava" was checked, causing "llava-4bit" to incorrectly attempt Florence inference.
-- **Lazy model loading:** Models load on first request (not container startup) via `_load_model()` and persist in module globals (`_model`, `_processor`, `_device`, `_dtype`, `_model_type`) for the container lifetime. No explicit unload between requests.
-- **Content type detection:** Examines `content_type` header to dispatch to text chunking, image description, audio transcription, or PDF extraction.
+- **Image model routing:** Checks `_model_type in ("llava", "llava-4bit")` to route correctly
+- **Lazy model loading:** Models load on first request and persist for container lifetime
 
 ## Build, Run, Debug
 
 - **Docker Compose (Windows PowerShell):**
   ```powershell
-  & 'C:\Program Files\Docker\Docker\resources\bin\docker.EXE' compose -f 'docker/tools-api/docker-compose.yaml' up -d --build
+  docker compose -f 'docker-compose.yaml' up -d --build
   ```
-- **Environment:** `memory_api` relies on env vars: `QDRANT_HOST`, `QDRANT_PORT`, `INDEX_NAME` (default `user_memory_collection`). `EMBEDDING_PROVIDER` currently informational; embeddings are via `SentenceTransformer`.
-- **Summarization:** Set `SUMMARY_MODEL` (default `sshleifer/distilbart-cnn-12-6`) and optionally `SUMMARY_DEVICE` (`cpu` or GPU index). If `HF_TOKEN` is set, summarization can use HuggingFace Inference API; otherwise, a local `transformers` pipeline is used. Use `STORE_VERBATIM=true|false` to control whether full message bodies are stored alongside summaries.
-- **Volumes:** Qdrant persists data under `C:/docker-data/qdrant/storage` mapped to `/qdrant/storage`.
-- **Local API test:** After containers are up, call:
+- **Environment:** Services configured via env vars in docker-compose.yaml
+- **Volumes:**
+  - Qdrant: `C:/docker-data/qdrant/storage`
+  - Models: `C:/docker-data/models`
+  - Filters: `./filters:/filters:ro` (read-only mount)
+- **Local API test:**
   ```powershell
-  Invoke-RestMethod -Uri 'http://localhost:8000/api/memory/search' -Method Post -Body (@{ user_id='anonymous'; query_text='project settings'; top_k=5 } | ConvertTo-Json) -ContentType 'application/json'
+  Invoke-RestMethod -Uri 'http://localhost:8000/api/memory/search' -Method Post -Body (@{ user_id='anonymous'; query_text='test'; top_k=5 } | ConvertTo-Json) -ContentType 'application/json'
   ```
-- **Hotspots for debugging:**
-  - Keyword extraction and gating in `_is_worth_saving`.
-  - Embedding text extraction in `embedder._extract_text_from_content`.
-  - Qdrant REST search payloads in `/save` and `/search`.
 
 ## Integration Notes
 
-- **Open‑WebUI filter contract:** `GET /api/memory/filter` returns the raw source of `memory.filter.py` so Open‑WebUI can parse tools. The filter calls `/api/memory/save` with `user_id`, `messages`, `model`.
-- **Context injection:** `_inject_context(body, existing_context)` inserts a system marker `[Retrieved from memory]` and prefers injecting `summary` (as `[Summary] ...`) plus a few non‑system messages. This keeps context succinct and relevant.
-- **Network:** Both services join `webtools_network` (external). In‑container hostnames: `memory_api` and `qdrant`.
-- **Summaries endpoint:** `POST /api/memory/summaries` accepts `SearchRequest` and returns top‑k `{ summary, score }` items for a user to enable lightweight retrieval.
-
-## Examples
-
-- **Embedding combined conversation:**
-  ```python
-  vec = embed_messages([
-    {"role":"system","content":"You are helpful"},
-    {"role":"user","content":[{"type":"text","text":"Order status for #123"}]}
-  ])
-  ```
-- **Qdrant REST search (by user):** filters on `{ key: 'user_id', match: { value: req.user_id } }` and sets `score_threshold` in `/save`.
-- **Summarize and save:** payloads include `summary` generated from messages; set `STORE_VERBATIM=false` to store summaries only.
+- **Jeeves filter:** `GET /api/jeeves/filter` returns filter source for Open-WebUI
+- **Legacy endpoint:** `/api/memory/filter` redirects to Jeeves filter
+- **Network:** All services join `webtools_network` (external)
+- **Filter editing:** Edit `filters/jeeves.filter.py` directly - no rebuild needed (mounted volume)
 
 ## Guardrails for Agents
 
 ### Memory Service
 
-- Do not change collection params unless migrating existing data; `_ensure_collection` purposely avoids modifying existing collections.
-- Preserve `Message` shape and mixed `content` handling to avoid losing multi‑modal context.
-- Keep embedding model and dim in sync across `embedder.py` and Qdrant `VectorParams(size=768)`.
-- When adding endpoints, follow router style in `app/api/memory.py` and use schemas in `app/utils/schemas.py`.
+- Do not change collection params unless migrating existing data
+- Keep embedding model and dim in sync (768-dim)
+- Preserve `Message` shape and mixed `content` handling
 
-### Extractor Service
+### Orchestrator/Executor
 
-- Model routing in `extract_from_image()` must check both `"llava"` and `"llava-4bit"` variants; do not break the condition.
-- Do not unload models between requests; lazy loading and persistence is intentional for performance.
-- Respect `IMAGE_MODEL` env var for model selection; support fallback logic (llava → florence).
-- Keep model quantization config (`BitsAndBytesConfig`) in sync with `_load_llava_4bit()` and docker-compose env vars (`IMAGE_MODEL=llava-4bit`, `HF_HOME=/models`).
+- Respect workspace_root boundaries for file operations
+- Check allowed_languages before code execution
+- Honor allow_file_write and allow_shell_commands flags

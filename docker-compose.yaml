@@ -50,15 +50,15 @@ services:
       - webtools_network
 
   # -------------------------------------------------
-  # Memory API
+  # Jeeves (Memory + Agent Core)
   # -------------------------------------------------
-  memory_api:
+  jeeves:
     build:
-      context: ./tools-api
+      context: ./layers
       dockerfile: memory/Dockerfile
       args:
         BASE_REGISTRY: ${BASE_REGISTRY:-jeeves}
-    container_name: memory_api
+    container_name: jeeves
     environment:
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
@@ -67,8 +67,10 @@ services:
       - SUMMARY_MODEL=sshleifer/distilbart-cnn-12-6
       - SUMMARY_DEVICE=0 # Use cpu for summarizer (or 0 for GPU)
       - HF_HOME=/models
+      - FILTERS_PATH=/filters
     volumes:
       - C:/docker-data/models:/models
+      - ./filters:/filters:ro
     ports:
       - "8000:8000"
     depends_on:
@@ -78,19 +80,24 @@ services:
       - webtools_network
 
   # -------------------------------------------------
-  # Pragmatics API
+  # Pragmatics API (Intent Classification)
   # -------------------------------------------------
   pragmatics_api:
     build:
-      context: ./tools-api/pragmatics
+      context: ./layers/pragmatics
       dockerfile: Dockerfile
       args:
         BASE_REGISTRY: ${BASE_REGISTRY:-jeeves}
     container_name: pragmatics_api
+    ports:
+      - "8001:8001"
     environment:
-      - CLASSIFIER_MODEL=distilbert_memory
+      # Use 4-class intent model (casual/save/recall/task)
+      # Fallback to distilbert_memory if distilbert_intent not found
+      - CLASSIFIER_MODEL=distilbert_intent
+      - INTENT_CONFIDENCE_THRESHOLD=0.50
     depends_on:
-      - memory_api
+      - jeeves
     restart: unless-stopped
     networks:
       - webtools_network
@@ -100,7 +107,7 @@ services:
   # -------------------------------------------------
   extractor_api:
     build:
-      context: ./tools-api/extractor
+      context: ./layers/extractor
       dockerfile: Dockerfile
       args:
         BASE_REGISTRY: ${BASE_REGISTRY:-jeeves}
@@ -129,7 +136,7 @@ services:
   # -------------------------------------------------
   orchestrator_api:
     build:
-      context: ./tools-api/orchestrator
+      context: ./layers/orchestrator
       dockerfile: Dockerfile
     container_name: orchestrator_api
     ports:
@@ -137,12 +144,16 @@ services:
     environment:
       - OLLAMA_HOST=http://ollama:11434
       - OLLAMA_MODEL=llama3.2
-      - MEMORY_API_URL=http://memory_api:8000
+      - MEMORY_API_URL=http://jeeves:8000
       - EXECUTOR_API_URL=http://executor_api:8005
       - MAX_PARALLEL_TASKS=5
+      - WORKSPACE_ROOT=/workspace
+      - HOST_WORKSPACE_PATH=${HOST_WORKSPACE_PATH:-C:/Code} # Configurable host path
+    volumes:
+      - ${HOST_WORKSPACE_PATH:-C:/Code}:/workspace:rw # Mount host code directory
     depends_on:
       - ollama
-      - memory_api
+      - jeeves
     restart: unless-stopped
     networks:
       - webtools_network
@@ -152,7 +163,7 @@ services:
   # -------------------------------------------------
   executor_api:
     build:
-      context: ./tools-api/executor
+      context: ./layers/executor
       dockerfile: Dockerfile
     container_name: executor_api
     ports:
@@ -160,6 +171,9 @@ services:
     environment:
       - DEFAULT_TIMEOUT=30
       - MAX_TIMEOUT=120
+      - WORKSPACE_ROOT=/workspace
+    volumes:
+      - ${HOST_WORKSPACE_PATH:-C:/Code}:/workspace:rw # Same mount as orchestrator
     restart: unless-stopped
     networks:
       - webtools_network
@@ -187,8 +201,8 @@ services:
       - MEMORY_SHORT_TERM_MEMORY_DEPTH=15
       - TOOLS_FUNCTION_CALLING_ENABLED=true
       - TOOLS_FUNCTION_CALLING_LLMS=ollama
-      - MEMORY_API_URL=http://memory_api:8000
-      - TOOLS_DISCOVERY_URL=http://memory_api:8000/api/tools
+      - MEMORY_API_URL=http://jeeves:8000
+      - TOOLS_DISCOVERY_URL=http://jeeves:8000/api/tools
     ports:
       - "8180:8080" # Host 8180 -> Container 8080 (8080 often reserved by Windows/Hyper-V)
     volumes:

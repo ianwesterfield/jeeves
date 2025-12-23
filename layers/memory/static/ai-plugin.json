@@ -1,0 +1,17 @@
+{
+  "schema_version": "v1",
+  "id": "jeeves_agent",
+  "name_for_human": "Jeeves Agent",
+  "name_for_model": "jeeves_agent",
+  "description_for_human": "Agentic assistant with semantic memory, intent classification, and code execution",
+  "description_for_model": "Use this tool to save or search user memories. Endpoints: /api/memory/save and /api/memory/search",
+  "auth": {
+    "type": "none"
+  },
+  "api": {
+    "type": "openapi",
+    "url": "http://jeeves:8000/.well-known/openapi.yaml",
+    "has_user_authentication": false
+  },
+  "contact_email": "aj@westerfield.cloud"
+}
