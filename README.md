@@ -31,22 +31,26 @@ Jeeves acts as an intelligent filter between you and your LLM. It:
 ## Architecture
 
 ```
-User message → Jeeves Filter → Intent Classification
+User message → Jeeves Filter → Intent Classification (Pragmatics)
                     ↓
               ┌─────┴─────┐
               │           │
-         Edit Request?   Read/Recall?
+           task?       recall/save/casual?
               │           │
               ↓           ↓
-         Executor API   Memory Search
-              │           │
-              ↓           ↓
-         File Modified   Context Injected
-              │           │
-              └─────┬─────┘
+         Orchestrator   Memory Search
+         (reasoning)       │
+              │           ↓
+              ↓      Context Injected
+         Executor API       │
+         (file ops)         │
+              │             │
+              └─────┬───────┘
                     ↓
               LLM Response
 ```
+
+**Key principle:** All task intents are delegated to the Orchestrator for reasoning - no shortcut patterns in the filter.
 
 ## Services
 
@@ -74,31 +78,34 @@ The pragmatics service uses a fine-tuned DistilBERT model (98% accuracy) to clas
 
 ## File Operations
 
-The filter detects edit patterns and executes them via the Executor API:
-
-### Supported Patterns
-
-```python
-# Append/Insert patterns
-"insert a credit to me in the readme"     → Appends to README.md
-"add my name to the readme file"          → Appends to README.md
-"put a section in ARCHITECTURE.md"        → Appends to ARCHITECTURE.md
-
-# Replace patterns
-"replace 'X' with 'Y' in file.txt"        → Surgical text replacement
-```
+All task requests are delegated to the Orchestrator, which reasons about the request and selects the appropriate tool. The Executor API then performs the operation.
 
 ### Executor API Tools
 
-| Tool              | Description                             |
-| ----------------- | --------------------------------------- |
-| `read_file`       | Read file contents                      |
-| `write_file`      | Overwrite entire file                   |
-| `replace_in_file` | Find and replace text (surgical)        |
-| `insert_in_file`  | Insert at start/end/before/after anchor |
-| `append_to_file`  | Append to end of file                   |
-| `list_files`      | List directory contents                 |
-| `scan_workspace`  | Recursive file search with glob         |
+| Tool              | Description                                          |
+| ----------------- | ---------------------------------------------------- |
+| `read_file`       | Read file contents                                   |
+| `write_file`      | Overwrite entire file                                |
+| `replace_in_file` | Find and replace text (surgical)                     |
+| `insert_in_file`  | Insert at start/end/before/after anchor              |
+| `append_to_file`  | Append to end of file                                |
+| `list_files`      | List directory contents                              |
+| `scan_workspace`  | Recursive search with gitignore, pretty table output |
+
+### scan_workspace Output
+
+```
+PATH: /workspace/jeeves
+TOTAL: 105 items (27 dirs, 78 files)
+
+NAME                                      TYPE    SIZE      MODIFIED
+----------------------------------------------------------------------
+filters                                   dir               2025-12-23 03:10:27
+layers                                    dir               2025-12-22 23:36:53
+README.md                                 file    8.32 KiB  2025-12-23 03:17:10
+docker-compose.yaml                       file    6.36 KiB  2025-12-23 03:55:25
+...
+```
 
 ## Running It
 
@@ -127,21 +134,12 @@ docker logs executor_api -f
 
 ### Filter Sync
 
-The Jeeves filter runs inside Open-WebUI. To sync changes:
+The Jeeves filter runs inside Open-WebUI (stored in database, not mounted volume). To sync changes:
 
 ```powershell
-# Sync filter to Open-WebUI
-python -c "
-import requests
-f = open('filters/jeeves.filter.py', encoding='utf-8').read()
-r = requests.post(
-    'http://localhost:8180/api/v1/functions/id/api/update',
-    headers={'Authorization':'Bearer YOUR_API_KEY','Content-Type':'application/json'},
-    json={'id':'api','name':'Jeeves Agentic','content':f,'meta':{'description':'Agent','toggle':True}},
-    timeout=30
-)
-print(f'Status: {r.status_code}')
-"
+# Sync filter to Open-WebUI (use utf-8-sig to strip BOM)
+$apiKey = (Get-Content "secrets/webui_admin_api_key.txt" -Raw).Trim()
+python -c "import requests; f=open('filters/jeeves.filter.py',encoding='utf-8-sig').read(); r=requests.post('http://localhost:8180/api/v1/functions/id/api/update', headers={'Authorization':'Bearer $apiKey'}, json={'id':'api','name':'Jeeves','content':f,'meta':{'toggle':True}}, timeout=10); print(r.status_code)"
 ```
 
 ## Project Structure
@@ -175,28 +173,47 @@ jeeves/
 ### 1. Filter Inlet (jeeves.filter.py)
 
 ```python
-# User says: "insert a credit to me in the readme file"
+# User says: "list the files in this workspace"
 #
 # 1. Intent classified as "task" (99% confidence)
-# 2. Edit pattern detected: insert + credit + readme
-# 3. Executor API called: append_to_file(README.md, "## Credits\n...")
-# 4. Result injected into context
-# 5. LLM confirms the edit was made
+# 2. Task delegated to Orchestrator for reasoning
+# 3. Orchestrator decides: scan_workspace tool
+# 4. Executor API executes scan with gitignore support
+# 5. Pretty-formatted table injected into context
+# 6. LLM presents the results
 ```
 
-### 2. Pattern Priority
+### 2. Always Delegate (No Shortcuts)
 
-Edit patterns are checked **FIRST**, before read/list patterns:
+All task intents go through the Orchestrator:
 
 ```python
-# Check order in _orchestrate_task():
-1. Edit patterns (insert/add/replace/append)  → Execute write
-2. Read patterns (show/read/display)          → Return content
-3. List patterns (list files/summarize)       → Return listing
-4. Orchestrator (complex tasks)               → Multi-step planning
+# Flow in _orchestrate_task():
+1. Set workspace context on Orchestrator
+2. Get next step (tool + params) from Orchestrator reasoning
+3. Execute tool via Executor API
+4. Return formatted results for context injection
+
+# No hardcoded patterns - Orchestrator decides the tool
 ```
 
-### 3. Memory Integration
+### 3. Status Messages
+
+The filter shows clean status messages during processing:
+
+| Icon | Status                |
+| ---- | --------------------- |
+| ✨   | Thinking / Processing |
+| 🔍   | Scanning workspace    |
+| 📖   | Reading files         |
+| ✏️   | Editing files         |
+| ⚙️   | Running code          |
+| 💾   | Saving to memory      |
+| 📚   | Memories found        |
+| ✅   | Ready / Complete      |
+| ❌   | Operation failed      |
+
+### 4. Memory Integration
 
 - **Save**: Facts extracted from conversation, embedded, stored in Qdrant
 - **Search**: Query embedded, similar memories retrieved (cosine similarity > 0.35)

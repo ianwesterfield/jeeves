@@ -169,13 +169,32 @@ async def execute_tool(request: ToolCallRequest) -> ToolResult:
     # Execute
     try:
         import time
+        import asyncio
+        import inspect
+        import json
         start = time.time()
-        result = await handler(request)
+        
+        # Call handler - may return coroutine or result directly
+        handler_result = handler(request)
+        
+        # If handler returns a coroutine (from async methods), await it
+        if inspect.iscoroutine(handler_result):
+            result = await handler_result
+        else:
+            result = handler_result
+        
         execution_time = time.time() - start
+        
+        # Get output - try 'output' first, then 'data'
+        output_data = result.get("output") or result.get("data")
+        
+        # Serialize complex outputs to JSON string
+        if output_data is not None and not isinstance(output_data, str):
+            output_data = json.dumps(output_data, indent=2, default=str)
         
         return ToolResult(
             success=result.get("success", True),
-            output=result.get("output"),
+            output=output_data,
             error=result.get("error"),
             execution_time=execution_time,
         )

@@ -64,6 +64,7 @@ jeeves/
 - **FastAPI app:** `main.py` on port 8005
 - **Router:** `api/executor.py` - tool, code, shell, file endpoints
 - **Services:** polyglot_handler.py (Python/PowerShell/Node), shell_handler.py, file_handler.py
+- **Dependencies:** `pathspec>=0.12.0` for gitignore pattern matching
 - **File Tools:**
   - `read_file` - Read file contents
   - `write_file` - Overwrite entire file
@@ -71,7 +72,7 @@ jeeves/
   - `insert_in_file` - Insert at position (start/end/before/after anchor)
   - `append_to_file` - Add to end of file
   - `list_files` - Directory listing
-  - `scan_workspace` - Recursive glob search
+  - `scan_workspace` - Recursive search with gitignore support, pretty table output (NAME/TYPE/SIZE/MODIFIED)
 
 ### Extractor Service (layers/extractor/)
 
@@ -83,12 +84,13 @@ jeeves/
 
 ### Jeeves Filter (filters/jeeves.filter.py)
 
-- **Intent classification:** Uses pragmatics_api (4-class: casual/save/recall/task) or falls back to regex heuristics
-- **Pattern priority:** Edit patterns checked FIRST, then read patterns, then list patterns, then orchestrator
-- **Edit patterns:** `insert/add/append/put/write/include/create` + file reference → Executor API
+- **Intent classification:** Uses pragmatics_api (4-class: casual/save/recall/task)
+- **Always delegate:** All task intents go to Orchestrator for reasoning (no shortcut patterns)
+- **Tool execution:** Orchestrator returns tool + params, filter executes via Executor API
 - **Memory operations:** Saves documents/images, searches for relevant context
 - **Context injection:** Prepends memories and analysis to user message
-- **Filter sync:** Edit `filters/jeeves.filter.py` directly, then sync via Open-WebUI API (not mounted volume)
+- **Status icons:** ✨ thinking, 🔍 scanning, 📖 reading, ✏️ editing, ⚙️ code, 💾 saving, 📚 memories, ✅ ready
+- **Filter sync:** Edit `filters/jeeves.filter.py` directly, then sync via Open-WebUI API (use utf-8-sig encoding)
 
 ### Memory Service
 
@@ -124,7 +126,9 @@ jeeves/
 - **Network:** All services join `webtools_network` (external)
 - **Filter sync:** Sync via Open-WebUI API after edits (filter stored in DB, not mounted volume):
   ```powershell
-  python -c "import requests; f=open('filters/jeeves.filter.py',encoding='utf-8').read(); r=requests.post('http://localhost:8180/api/v1/functions/id/api/update', headers={'Authorization':'Bearer YOUR_API_KEY'}, json={'id':'api','name':'Jeeves','content':f,'meta':{'toggle':True}}, timeout=30); print(r.status_code)"
+  # Use utf-8-sig to strip BOM (prevents parse errors)
+  $apiKey = (Get-Content "secrets/webui_admin_api_key.txt" -Raw).Trim()
+  python -c "import requests; f=open('filters/jeeves.filter.py',encoding='utf-8-sig').read(); r=requests.post('http://localhost:8180/api/v1/functions/id/api/update', headers={'Authorization':'Bearer $apiKey'}, json={'id':'api','name':'Jeeves','content':f,'meta':{'toggle':True}}, timeout=10); print(r.status_code)"
   ```
 
 ## Guardrails for Agents

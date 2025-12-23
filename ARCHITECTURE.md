@@ -56,28 +56,33 @@ The main entry point running inside Open-WebUI.
 **Responsibilities:**
 
 - Classify user intent via Pragmatics API
-- Detect edit patterns (insert/add/replace) and execute via Executor
+- Delegate all task intents to Orchestrator for reasoning
+- Execute tool calls via Executor API
 - Search memory for relevant context
 - Inject context and results into LLM conversation
 
-**Pattern Priority (checked in order):**
+**Flow (Always Delegate):**
 
 ```python
-1. Edit patterns     → Execute write via Executor API
-2. Read patterns     → Read file, return content
-3. List patterns     → Scan workspace, return listing
-4. Orchestrator      → Multi-step task planning
-5. Memory search     → Retrieve relevant memories
+1. Classify intent via Pragmatics API
+2. If task → Delegate to Orchestrator (no shortcuts)
+3. Orchestrator reasons and returns tool + params
+4. Execute tool via Executor API
+5. Inject formatted results into context
 ```
 
-**Edit Pattern Detection:**
+**Status Icons:**
 
-```python
-# Supported patterns:
-"insert X in readme"          → append_to_file(README.md)
-"add X to README.md"          → append_to_file(README.md)
-"replace 'X' with 'Y' in F"   → replace_in_file(F, X, Y)
-```
+| Icon | Meaning             |
+| ---- | ------------------- |
+| ✨   | Thinking/Processing |
+| 🔍   | Scanning workspace  |
+| 📖   | Reading files       |
+| ✏️   | Editing files       |
+| ⚙️   | Running code        |
+| 💾   | Saving to memory    |
+| 📚   | Memories found      |
+| ✅   | Ready/Complete      |
 
 ---
 
@@ -121,6 +126,13 @@ Polyglot code execution and file operations with sandbox enforcement.
 | `append_to_file`  | `append(path, content)`   | Add to end of file    |
 | `list_files`      | `list_dir(path)`          | Directory listing     |
 | `scan_workspace`  | `scan(path, pattern)`     | Recursive glob search |
+
+**scan_workspace Features:**
+
+- **Gitignore support**: Respects `.gitignore` patterns via `pathspec` library
+- **Pretty output**: Unified table with NAME, TYPE, SIZE, MODIFIED columns
+- **Hidden files**: Skips dotfiles and `.git` by default
+- **Human-readable sizes**: Shows KiB, MiB, etc.
 
 **Positions for insert_in_file:**
 
@@ -202,35 +214,43 @@ Media-to-text extraction (GPU-accelerated).
 
 ### 6. Orchestrator API (Port 8004)
 
-Multi-step reasoning and task planning (under development).
+Multi-step reasoning and task planning.
 
 **Endpoints:**
 
 ```
-POST /api/orchestrator/set-workspace
-POST /api/orchestrator/next-step
-POST /api/orchestrator/execute-batch
+POST /api/orchestrate/set-workspace   # Set workspace context
+POST /api/orchestrate/next-step       # Get next tool + params
+POST /api/orchestrate/execute-batch   # Execute multiple steps
 ```
+
+**Role:** The Orchestrator is the "brain" that decides which tool to use. All task intents are delegated to it - there are no hardcoded patterns in the filter.
 
 ---
 
 ## Data Flow
 
-### Edit Request Flow
+### Task Request Flow (Always Delegate)
 
 ```
-User: "insert a credit to me in the readme"
+User: "list the files in this workspace"
                     │
                     ▼
 ┌─────────────────────────────────────────┐
 │        jeeves.filter.py inlet()         │
 │                                         │
 │  1. Classify intent → "task" (99%)      │
-│  2. Match edit pattern:                 │
-│     "insert" + "credit" + "readme"      │
-│  3. Normalize file → README.md          │
-│  4. Build content:                      │
-│     "## Credits\n- Ian - Creator"       │
+│  2. Delegate to Orchestrator            │
+│     (no hardcoded patterns)             │
+└─────────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────┐
+│       Orchestrator API (8004)           │
+│                                         │
+│  POST /api/orchestrate/next-step        │
+│  Reasoning: "User wants workspace tree" │
+│  Returns: tool=scan_workspace, path="." │
 └─────────────────────────────────────────┘
                     │
                     ▼
@@ -238,23 +258,27 @@ User: "insert a credit to me in the readme"
 │         Executor API (8005)             │
 │                                         │
 │  POST /api/execute/tool                 │
-│  tool: "append_to_file"                 │
-│  path: "/workspace/jeeves/README.md"    │
-│  content: "## Credits\n- Ian..."        │
+│  - Loads .gitignore patterns            │
+│  - Scans recursively                    │
+│  - Returns pretty table:                │
+│    PATH: /workspace/jeeves              │
+│    TOTAL: 105 items (27 dirs, 78 files) │
+│    NAME         TYPE  SIZE     MODIFIED │
+│    filters      dir            2025-... │
+│    README.md    file  8.3 KiB  2025-... │
 └─────────────────────────────────────────┘
                     │
                     ▼
 ┌─────────────────────────────────────────┐
 │        Filter injects result            │
 │                                         │
-│  "### File Operation Result ###         │
-│   Operation: Append to README.md        │
-│   Status: ✅ Success                    │
-│   Added: ## Credits..."                 │
+│  "### Workspace Files ###               │
+│   <pretty table>                        │
+│   ### End Workspace Files ###"          │
 └─────────────────────────────────────────┘
                     │
                     ▼
-         LLM confirms edit done
+         LLM presents the results
 ```
 
 ### Memory Search Flow
@@ -395,17 +419,9 @@ class WorkspaceContext:
 After editing `filters/jeeves.filter.py`, sync to Open-WebUI:
 
 ```powershell
-python -c "
-import requests
-f = open('filters/jeeves.filter.py', encoding='utf-8').read()
-r = requests.post(
-    'http://localhost:8180/api/v1/functions/id/api/update',
-    headers={'Authorization':'Bearer YOUR_API_KEY'},
-    json={'id':'api','name':'Jeeves','content':f,'meta':{'toggle':True}},
-    timeout=30
-)
-print(f'Status: {r.status_code}')
-"
+# Use utf-8-sig encoding to strip BOM (prevents parse errors)
+$apiKey = (Get-Content "secrets/webui_admin_api_key.txt" -Raw).Trim()
+python -c "import requests; f=open('filters/jeeves.filter.py',encoding='utf-8-sig').read(); r=requests.post('http://localhost:8180/api/v1/functions/id/api/update', headers={'Authorization':'Bearer $apiKey'}, json={'id':'api','name':'Jeeves','content':f,'meta':{'toggle':True}}, timeout=10); print(r.status_code)"
 ```
 
 ### Rebuild Services

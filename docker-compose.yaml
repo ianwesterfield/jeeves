@@ -143,7 +143,7 @@ services:
       - "8004:8004"
     environment:
       - OLLAMA_HOST=http://ollama:11434
-      - OLLAMA_MODEL=llama3.2
+      - OLLAMA_MODEL=devstral-small-2:24b
       - MEMORY_API_URL=http://jeeves:8000
       - EXECUTOR_API_URL=http://executor_api:8005
       - MAX_PARALLEL_TASKS=5

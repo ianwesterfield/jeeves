@@ -1,4 +1,4 @@
-"""
+﻿"""
 Jeeves Filter - Agentic Reasoning & Memory Integration
 
 Open-WebUI filter that provides:
@@ -31,23 +31,39 @@ PRAGMATICS_API_URL = os.getenv("PRAGMATICS_API_URL", "http://pragmatics_api:8001
 # System prompt describing Jeeves capabilities
 JEEVES_SYSTEM_PROMPT = """You are Jeeves, an AI assistant with access to the user's workspace and semantic memory.
 
-**Your Capabilities:**
-- **Workspace Access**: You can read, list, and edit files in the user's workspace
-- **File Editing**: You can make surgical edits (replace text, insert at position, append)
-- **Memory**: You remember information about the user across conversations
-- **Code Execution**: When enabled, you can run Python, PowerShell, and Node.js code
+**CRITICAL RULES - FOLLOW EXACTLY:**
 
-**When the user asks to edit/modify files:**
-- If you see "### File Operation Result ###" below, the edit has ALREADY BEEN EXECUTED
-- Report the result to the user - don't claim you'll do it, confirm it's done
-- If the operation failed, explain why and suggest alternatives
+1. **NEVER HALLUCINATE FILE LISTINGS OR FILE CONTENTS**
+   - ONLY show files that appear in "### Workspace Files ###" blocks
+   - ONLY show content that appears in "### File Content ###" blocks  
+   - If you don't see actual data in these blocks, say "no data available"
+   - DO NOT make up, guess, or extrapolate file names - EVER
 
-**When the user asks about files or workspace:**
-- If workspace context is provided below, use that information to answer
-- Be specific about file names, paths, and contents
-- If no workspace context is provided, explain you need workspace access configured
+2. **You do NOT call tools directly**
+   - The Jeeves filter pre-processes requests and injects real results
+   - NEVER output tool call syntax like [TOOL_CALLS] - it does nothing
 
-**Important**: When Jeeves Analysis or Workspace Results are included in the conversation, use that real data to answer the user's question directly.
+3. **How to handle injected context:**
+   - "### Workspace Files ###" → Contains the REAL file listing - show ONLY these files
+   - "### File Content ###" → Contains REAL file contents - quote from this ONLY
+   - "### File Operation Result ###" → An edit was executed - report the result
+   - "### Retrieved Memories ###" → Relevant memories about the user
+
+4. **If context blocks are empty or missing:**
+   - Say you couldn't retrieve the information
+   - DO NOT make up a response
+   - Ask if the user wants to try again
+
+**Example of CORRECT behavior:**
+If you see: "📁 filters\n📁 layers\n📄 README.md"
+Say: "The workspace contains 2 directories (filters, layers) and 1 file (README.md)"
+Do NOT add files that aren't in the list!
+
+**Your Capabilities (handled by Jeeves filter):**
+- Workspace file listing and reading
+- Surgical file edits (replace, insert, append)
+- Semantic memory across conversations
+- Code execution (when enabled)
 """
 
 # File type to MIME type mapping
@@ -104,14 +120,83 @@ def _classify_intent(text: str) -> Dict[str, Any]:
 # Workspace Operations (Direct Execution)
 # ============================================================================
 
-def _list_workspace_files(workspace_root: str, max_depth: int = 2) -> Optional[str]:
+def _list_workspace_files(workspace_root: str, recursive: bool = True, max_depth: int = 3) -> Optional[str]:
     """
     List files in workspace via executor API.
+    
+    Args:
+        workspace_root: Path to list
+        recursive: If True, list subdirectories too
+        max_depth: Max depth for recursive listing
     
     Returns formatted file listing or None on error.
     """
     try:
-        # First try file listing endpoint
+        if recursive:
+            # Use scan_workspace tool for recursive listing
+            resp = requests.post(
+                f"{EXECUTOR_API_URL}/api/execute/tool",
+                json={
+                    "tool": "scan_workspace",
+                    "params": {
+                        "path": workspace_root,
+                        "pattern": "*",
+                    },
+                    "workspace_context": {
+                        "workspace_root": "/workspace",
+                        "cwd": "/workspace",
+                        "allow_file_write": False,
+                    },
+                },
+                timeout=30,
+            )
+            
+            if resp.status_code == 200:
+                result = resp.json()
+                if result.get("success") and result.get("output"):
+                    import json as json_module
+                    try:
+                        data = json_module.loads(result["output"])
+                        files = data.get("files", [])
+                        dirs = data.get("dirs", [])
+                        
+                        # Filter by depth and exclude .git internals
+                        def filter_by_depth(paths, max_d):
+                            filtered = []
+                            for p in paths:
+                                # Skip .git internals (but keep .git itself)
+                                if ".git/" in p or ".git\\" in p:
+                                    continue
+                                # Check depth
+                                depth = p.count("/") + p.count("\\")
+                                if depth <= max_d:
+                                    filtered.append(p)
+                            return sorted(filtered)
+                        
+                        files = filter_by_depth(files, max_depth)
+                        dirs = filter_by_depth(dirs, max_depth)
+                        
+                        # Build tree-like output
+                        lines = []
+                        all_items = [(d, "dir") for d in dirs] + [(f, "file") for f in files]
+                        all_items.sort(key=lambda x: x[0])
+                        
+                        for path, item_type in all_items[:150]:
+                            prefix = "📁 " if item_type == "dir" else "📄 "
+                            # Add indentation based on depth
+                            depth = path.count("/") + path.count("\\")
+                            indent = "  " * depth
+                            name = path.split("/")[-1].split("\\")[-1]
+                            lines.append(f"{indent}{prefix}{path}")
+                        
+                        if data.get("truncated"):
+                            lines.append("... (truncated)")
+                        
+                        return "\n".join(lines) if lines else "No files found"
+                    except:
+                        pass
+        
+        # Fallback: simple flat listing
         resp = requests.post(
             f"{EXECUTOR_API_URL}/api/execute/file",
             json={
@@ -131,39 +216,6 @@ def _list_workspace_files(workspace_root: str, max_depth: int = 2) -> Optional[s
                         prefix = "📁 " if item.get("type") == "dir" else "📄 "
                         lines.append(f"{prefix}{item.get('name', '?')}")
                     return "\n".join(lines)
-        
-        # Fallback: use Python code execution for recursive listing
-        resp = requests.post(
-            f"{EXECUTOR_API_URL}/api/execute/code",
-            json={
-                "language": "python",
-                "code": f'''
-import os
-from pathlib import Path
-
-workspace = Path("{workspace_root}")
-if workspace.exists():
-    files = []
-    for item in sorted(workspace.rglob("*")):
-        try:
-            rel = item.relative_to(workspace)
-            if len(rel.parts) <= {max_depth}:
-                prefix = "📁 " if item.is_dir() else "📄 "
-                files.append(prefix + str(rel))
-        except:
-            pass
-    print("\\n".join(files[:100]) if files else "No files found")
-else:
-    print(f"Workspace not found: {workspace_root}")
-''',
-                "timeout": 10,
-            },
-            timeout=15,
-        )
-        
-        if resp.status_code == 200:
-            result = resp.json()
-            return result.get("stdout", result.get("output", ""))
             
     except Exception as e:
         print(f"[jeeves] File listing error: {e}")
@@ -356,6 +408,59 @@ def _append_to_workspace_file(workspace_root: str, filepath: str, content: str) 
 # Orchestrator Integration
 # ============================================================================
 
+def _execute_tool(workspace_root: str, tool: str, params: dict) -> dict:
+    """
+    Execute a tool via the executor API.
+    
+    Args:
+        workspace_root: Container path like /workspace/jeeves
+        tool: Tool name
+        params: Tool parameters (paths will be resolved relative to workspace_root)
+    
+    Returns dict with success, output, error.
+    """
+    try:
+        # Resolve relative paths in params
+        resolved_params = params.copy()
+        if "path" in resolved_params:
+            path = resolved_params["path"]
+            
+            # Extract project name from workspace_root (e.g., "jeeves" from "/workspace/jeeves")
+            project_name = workspace_root.rstrip("/").split("/")[-1].lower()
+            
+            # Handle relative paths
+            if path == "." or path == "" or path.lower() == project_name:
+                # ".", "", or project name itself → workspace root
+                resolved_params["path"] = workspace_root
+            elif not path.startswith("/"):
+                # Other relative paths → resolve relative to workspace
+                resolved_params["path"] = f"{workspace_root}/{path}"
+        
+        resp = requests.post(
+            f"{EXECUTOR_API_URL}/api/execute/tool",
+            json={
+                "tool": tool,
+                "params": resolved_params,
+                "workspace_context": {
+                    "workspace_root": "/workspace",  # Container mount point
+                    "cwd": workspace_root,
+                    "allow_file_write": True,
+                    "allow_shell_commands": False,
+                    "allowed_languages": ["python"],
+                },
+            },
+            timeout=60,
+        )
+        
+        if resp.status_code == 200:
+            return resp.json()
+        else:
+            return {"success": False, "output": None, "error": f"HTTP {resp.status_code}"}
+            
+    except Exception as e:
+        return {"success": False, "output": None, "error": str(e)}
+
+
 async def _orchestrate_task(
     user_id: str,
     messages: List[dict],
@@ -363,286 +468,198 @@ async def _orchestrate_task(
     __event_emitter__,
 ) -> Optional[str]:
     """
-    Handle task intents with direct execution for common operations.
+    Handle task intents via orchestrator reasoning + executor.
     
-    For simple file operations, executes directly.
-    For complex tasks, delegates to orchestrator for planning.
+    Flow:
+      1. Send task to orchestrator for reasoning
+      2. Orchestrator returns next step (tool + params)
+      3. Execute step via executor
+      4. Return results
     
     Returns context string to inject into conversation.
     """
     user_text = _extract_user_text_prompt(messages) or ""
-    original_user_text = user_text  # Keep original case for content extraction
-    user_text_lower = user_text.lower()
     
-    # Direct execution for common workspace operations
-    if workspace_root:
-        
-        # ================================================================
-        # EDIT OPERATIONS - Check these FIRST before read/list!
-        # ================================================================
-        # Detect edit intent: add/insert/append/update/edit + file reference
-        edit_verbs = r'(?:add|insert|append|put|write|include|create)'
-        file_refs = r'(?:readme|architecture|docker-compose|\w+\.\w+)'
-        
-        edit_intent_match = re.search(
-            rf'{edit_verbs}\s+(?:a\s+)?(.+?)\s+(?:to|in|into)\s+(?:the\s+)?(?:file\s+)?({file_refs})',
-            original_user_text,
-            re.IGNORECASE
-        )
-        
-        if edit_intent_match:
-            content_description = edit_intent_match.group(1).strip()
-            file_ref = edit_intent_match.group(2).strip()
-            
-            # Normalize file references
-            file_ref_lower = file_ref.lower()
-            if "readme" in file_ref_lower:
-                target_file = "README.md"
-            elif "architecture" in file_ref_lower:
-                target_file = "ARCHITECTURE.md"
-            elif "docker-compose" in file_ref_lower or "docker compose" in file_ref_lower:
-                target_file = "docker-compose.yaml"
-            elif "gitignore" in file_ref_lower:
-                target_file = ".gitignore"
-            else:
-                target_file = file_ref
-            
-            target_path = f"{workspace_root}/{target_file}"
-            
-            await __event_emitter__({
-                "type": "status",
-                "data": {"description": f"✏️ Editing {target_file}...", "done": False, "hidden": False}
-            })
-            
-            # For natural language requests, construct the content
-            if "credit" in content_description.lower():
-                # Get user's name from memories if available
-                user_name = "Ian"  # TODO: extract from memory context
-                content_to_add = f"\n\n## Credits\n\n- **{user_name}** - Creator and maintainer\n"
-            elif "contributor" in content_description.lower():
-                user_name = "Ian"
-                content_to_add = f"\n\n## Contributors\n\n- **{user_name}**\n"
-            else:
-                # Use the description as content
-                content_to_add = f"\n{content_description}\n"
-            
-            success, msg = _append_to_workspace_file(workspace_root, target_path, content_to_add)
-            
-            if success:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {"description": f"✅ Updated {target_file}", "done": True, "hidden": False}
-                })
-                
-                # Read back to show result
-                new_content = _read_workspace_file(workspace_root, target_path, max_lines=50)
-                
-                return f"""### File Operation Result ###
-**Operation:** Append to {target_file}
-**Status:** ✅ Success
-**Added:**
-```
-{content_to_add}
-```
-
-**Updated file (last 50 lines):**
-```
-{new_content or "(unable to read back)"}
-```
-### End File Operation ###
-
-"""
-            else:
-                return f"""### File Operation Result ###
-**Operation:** Append to {target_file}
-**Status:** ❌ Failed
-**Error:** {msg}
-### End File Operation ###
-
-"""
-        
-        # Pattern: Replace "X" with "Y" in file.txt
-        replace_match = re.search(
-            r'replace\s+["\'](.+?)["\']\s+with\s+["\'](.+?)["\']\s+in\s+(?:the\s+)?(?:file\s+)?["\']?(\w+\.\w+)["\']?',
-            original_user_text,
-            re.IGNORECASE | re.DOTALL
-        )
-        
-        if replace_match:
-            old_text = replace_match.group(1)
-            new_text = replace_match.group(2)
-            target_file = replace_match.group(3)
-            target_path = f"{workspace_root}/{target_file}"
-            
-            await __event_emitter__({
-                "type": "status",
-                "data": {"description": f"✏️ Replacing in {target_file}...", "done": False, "hidden": False}
-            })
-            
-            success, msg = _replace_in_workspace_file(workspace_root, target_path, old_text, new_text)
-            
-            if success:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {"description": f"✅ Updated {target_file}", "done": True, "hidden": False}
-                })
-                
-                return f"""### File Operation Result ###
-**Operation:** Replace in {target_file}
-**Status:** ✅ Success
-**Changed:** `{old_text}` → `{new_text}`
-### End File Operation ###
-
-"""
-            else:
-                return f"""### File Operation Result ###
-**Operation:** Replace in {target_file}
-**Status:** ❌ Failed
-**Error:** {msg}
-### End File Operation ###
-
-"""
-        
-        # ================================================================
-        # READ OPERATIONS - Only if not an edit request
-        # ================================================================
-        # List files request - but exclude edit verbs
-        list_keywords = [
-            "list files", "show files", "what files", "list the files", "files in",
-            "summarize", "analyze", "read the", "look at the", "check the",
-            "what's in", "whats in", "contents of", "structure of",
-            "show me the readme", "show me the architecture"
-        ]
-        if any(kw in user_text_lower for kw in list_keywords):
-            await __event_emitter__({
-                "type": "status",
-                "data": {"description": "📂 Listing workspace files...", "done": False, "hidden": False}
-            })
-            
-            file_listing = _list_workspace_files(workspace_root)
-            
-            if file_listing:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {"description": "✅ Workspace scanned", "done": False, "hidden": False}
-                })
-                
-                context_parts = [f"""### Workspace Files ###
-**Workspace:** `{workspace_root}`
-
-```
-{file_listing}
-```
-### End Workspace Files ###
-"""]
-                
-                # If user asked to read/show specific files, also read key documentation files
-                if any(kw in user_text_lower for kw in ["summarize", "analyze", "read the", "look at", "show me", "print the", "display the", "readme", "architecture"]):
-                    doc_files = ["README.md", "ARCHITECTURE.md", "docker-compose.yaml"]
-                    for doc in doc_files:
-                        doc_path = f"{workspace_root}/{doc}"
-                        await __event_emitter__({
-                            "type": "status",
-                            "data": {"description": f"📖 Reading {doc}...", "done": False, "hidden": False}
-                        })
-                        content = _read_workspace_file(workspace_root, doc_path, max_lines=200)
-                        if content:
-                            context_parts.append(f"""### File: {doc} ###
-```
-{content}
-```
-### End {doc} ###
-""")
-                
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {"description": "✅ Context gathered", "done": True, "hidden": False}
-                })
-                
-                return "\n".join(context_parts)
-            else:
-                return f"""### Workspace Error ###
-Could not list files in workspace: `{workspace_root}`
-The executor service may not be running or the path may not exist.
-### End Workspace Error ###
-
-"""
-        
-        # Read file request - require explicit file path patterns
-        # Must have file extension or path separator to avoid matching phrases like "read each"
-        file_read_match = re.search(r'(?:read|show|display|cat|open)\s+(?:the\s+)?(?:file\s+)?["\']?([^\s"\']+\.[a-zA-Z0-9]+|/[^\s"\']+)["\']?', user_text_lower)
-        if file_read_match:
-            filepath = file_read_match.group(1)
-            
-            await __event_emitter__({
-                "type": "status",
-                "data": {"description": f"📖 Reading {filepath}...", "done": False, "hidden": False}
-            })
-            
-            content = _read_workspace_file(workspace_root, filepath)
-            
-            if content:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {"description": "✅ File read", "done": True, "hidden": False}
-                })
-                
-                return f"""### File Content: {filepath} ###
-```
-{content}
-```
-### End File Content ###
-
-"""
+    if not workspace_root:
+        return None
     
-    # For other tasks, try the orchestrator planning service
     try:
-        if workspace_root:
-            requests.post(
-                f"{ORCHESTRATOR_API_URL}/api/orchestrator/set-workspace",
-                json={"cwd": workspace_root, "user_id": user_id},
-                timeout=10,
-            )
+        # Set workspace context
+        await __event_emitter__({
+            "type": "status",
+            "data": {"description": "✨ Thinking...", "done": False, "hidden": False}
+        })
         
+        requests.post(
+            f"{ORCHESTRATOR_API_URL}/api/orchestrate/set-workspace",
+            json={"cwd": workspace_root, "user_id": user_id},
+            timeout=10,
+        )
+        
+        # Get next step from orchestrator
         resp = requests.post(
-            f"{ORCHESTRATOR_API_URL}/api/orchestrator/next-step",
+            f"{ORCHESTRATOR_API_URL}/api/orchestrate/next-step",
             json={
                 "task": user_text,
                 "user_id": user_id,
                 "conversation_history": messages[-10:],
             },
-            timeout=30,
+            timeout=120,  # Allow time for LLM reasoning
         )
         
         if resp.status_code != 200:
+            print(f"[jeeves] Orchestrator returned {resp.status_code}")
             return None
         
-        result = resp.json()
-        steps = result.get("steps", [])
-        reasoning = result.get("reasoning", "")
-        
-        if not steps and not reasoning:
-            return None
+        step = resp.json()
+        tool = step.get("tool", "complete")
+        params = step.get("params", {})
+        reasoning = step.get("reasoning", "")
         
         await __event_emitter__({
             "type": "status",
-            "data": {"description": f"🤔 Planning: {len(steps)} step(s)", "done": False, "hidden": False}
+            "data": {"description": f"✨ {reasoning[:60]}", "done": False, "hidden": False}
         })
         
-        step_descriptions = [f"{i+1}. [{s.get('tool', '?')}] {s.get('description', '')}" 
-                           for i, s in enumerate(steps)]
-        
-        return f"""### Jeeves Analysis ###
-{reasoning}
+        # Handle completion (no action needed)
+        if tool == "complete":
+            if params.get("error"):
+                return f"""### Orchestrator Error ###
+{params.get('error')}
+### End Error ###
 
-Suggested approach:
-{chr(10).join(step_descriptions) if step_descriptions else "Direct response recommended."}
-### End Analysis ###
+"""
+            return None  # Task complete, let LLM respond naturally
+        
+        # Execute the planned step
+        # Format status based on tool type
+        tool_path = params.get("path", "")
+        if tool == "scan_workspace":
+            status_msg = f"🔍 Scanning {tool_path or 'workspace'}..."
+        elif tool == "read_file":
+            status_msg = f"📖 Reading {tool_path}..."
+        elif tool in ("write_file", "replace_in_file", "insert_in_file", "append_to_file"):
+            status_msg = f"✏️ Editing {tool_path}..."
+        elif tool == "execute_code":
+            status_msg = f"⚙️ Running code..."
+        else:
+            status_msg = f"⚡ {tool}..."
+        
+        await __event_emitter__({
+            "type": "status",
+            "data": {"description": status_msg, "done": False, "hidden": False}
+        })
+        
+        result = _execute_tool(workspace_root, tool, params)
+        
+        success = result.get("success", False)
+        output = result.get("output")
+        error = result.get("error")
+        
+        if success:
+            # Clean completion message
+            if tool == "scan_workspace":
+                done_msg = "✅ Scan complete"
+            elif tool == "read_file":
+                done_msg = "✅ File loaded"
+            elif tool in ("write_file", "replace_in_file", "insert_in_file", "append_to_file"):
+                done_msg = "✅ File updated"
+            elif tool == "execute_code":
+                done_msg = "✅ Code executed"
+            else:
+                done_msg = "✅ Done"
+            
+            await __event_emitter__({
+                "type": "status",
+                "data": {"description": done_msg, "done": True, "hidden": False}
+            })
+            
+            # Format output based on tool type
+            if tool == "scan_workspace":
+                # Executor now returns pretty-formatted string directly
+                formatted = output if output else "(no files found)"
+                
+                return f"""### Workspace Files ###
+**Reasoning:** {reasoning}
+
+The following is a unified listing (directories and files together, sorted alphabetically with directories first). Present this table as-is without splitting into separate sections:
+
+```
+{formatted}
+```
+
+### End Workspace Files ###
+
+"""
+            
+            elif tool == "read_file":
+                path = params.get("path", "file")
+                return f"""### File Content: {path} ###
+**Reasoning:** {reasoning}
+
+```
+{output or "(empty)"}
+```
+### End File Content ###
+
+"""
+            
+            elif tool in ("write_file", "append_to_file", "replace_in_file", "insert_in_file"):
+                path = params.get("path", "file")
+                return f"""### File Operation Result ###
+**Operation:** {tool} on {path}
+**Status:** ✅ Success
+**Reasoning:** {reasoning}
+**Result:** {output or "OK"}
+### End File Operation ###
+
+"""
+            
+            elif tool == "execute_code":
+                lang = params.get("language", "code")
+                return f"""### Code Execution Result ###
+**Language:** {lang}
+**Reasoning:** {reasoning}
+
+```
+{output or "(no output)"}
+```
+### End Code Execution ###
+
+"""
+            
+            else:
+                # Generic output
+                return f"""### {tool} Result ###
+**Reasoning:** {reasoning}
+
+```
+{output or "(no output)"}
+```
+### End Result ###
+
+"""
+        
+        else:
+            await __event_emitter__({
+                "type": "status",
+                "data": {"description": "❌ Operation failed", "done": True, "hidden": False}
+            })
+            
+            return f"""### Execution Error ###
+**Tool:** {tool}
+**Reasoning:** {reasoning}
+**Error:** {error or "Unknown error"}
+### End Error ###
 
 """
         
     except Exception as e:
         print(f"[jeeves] Orchestrator error: {e}")
+        await __event_emitter__({
+            "type": "status",
+            "data": {"description": f"❌ Error: {str(e)[:30]}", "done": True, "hidden": False}
+        })
         return None
 
 
@@ -1018,9 +1035,10 @@ class Filter:
         """Initialize Jeeves filter."""
         self.user_valves = self.UserValves()
         self.toggle = True
+        # Butler icon - person with bow tie silhouette
         self.icon = (
             "data:image/svg+xml;base64,"
-            "PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIGZpbGw9Im5vbmUiIHZpZXdCb3g9IjAgMCAyNCAyNCIgc3Ryb2tlLXdpZHRoPSIxLjUiIHN0cm9rZT0iY3VycmVudENvbG9yIj4KICA8cGF0aCBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGQ9Ik05LjgxMyAxNS45MDRMOSAxOC43NWwtLjgxMy0yLjg0NmE0LjUgNC41IDAgMDAtMy4wOS0zLjA5TDIuMjUgMTJsODQ2LS44MTNhNC41IDQuNSAwIDAwMy4wOS0zLjA5TDE1IDUuMjVsLjgxMyAyLjg0NmE0LjUgNC41IDAgMDAzLjA5IDMuMDlMMjEuNzUgMTJsLTIuODQ2LjgxM2E0LjUgNC41IDAgMDAtMy4wOSAzLjA5ek0xOC4yNTkgOC43MTVMMTggOS43NWwtLjI1OS0xLjAzNWE0LjUgNC41IDAgMDAtMi41LTIuNUwxNCA1Ljk1NmwxLjAzNS0uMjU5YTQuNSA0LjUgMCAwMDIuNS0yLjVMMTggMi4xNjJsLjI1OSAxLjAzNWE0LjUgNC41IDAgMDAyLjUgMi41TDIxLjc5NCA2bC0xLjAzNS4yNTlhNC41IDQuNSAwIDAwLTIuNSAyLjVaIiAvPgo8L3N2Zz4K"
+            "PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iY3VycmVudENvbG9yIj4KICA8IS0tIEhlYWQgLS0+CiAgPGNpcmNsZSBjeD0iMTIiIGN5PSI2IiByPSIzLjUiLz4KICA8IS0tIEJvdyB0aWUgLS0+CiAgPHBhdGggZD0iTTkgMTJsLTIgMS41TDkgMTVoNmwyLTEuNUwxNSAxMkg5eiIvPgogIDwhLS0gQm9keSAtLT4KICA8cGF0aCBkPSJNNiAxNWMwLTEgMS41LTIgNi0yIDQuNSAwIDYgMSA2IDJ2NmMwIC41LS41IDEtMSAxSDdjLS41IDAtMS0uNS0xLTF2LTZ6Ii8+Cjwvc3ZnPgo="
         )
     
     def _inject_context(self, body: dict, context_items: List[dict], orchestrator_context: Optional[str] = None) -> dict:
@@ -1117,7 +1135,7 @@ class Filter:
             
             await __event_emitter__({
                 "type": "status",
-                "data": {"description": "🎩 Jeeves processing...", "done": False, "hidden": False}
+                "data": {"description": "✨ Thinking...", "done": False, "hidden": False}
             })
             
             # Extract user text for classification
@@ -1145,7 +1163,7 @@ class Filter:
                 await __event_emitter__({
                     "type": "status",
                     "data": {
-                        "description": f"📄 Saving {len(chunks)} chunks...",
+                        "description": f"💾 Saving {len(chunks)} chunk(s)...",
                         "done": False,
                         "hidden": False,
                     }
@@ -1167,14 +1185,8 @@ class Filter:
                 intent = intent_result.get("intent", "casual")
                 confidence = intent_result.get("confidence", 0.5)
                 
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {
-                        "description": f"🎯 Intent: {intent} ({confidence:.0%})",
-                        "done": False,
-                        "hidden": False,
-                    }
-                })
+                # Don't show intent classification to user - just continue thinking
+                pass  # Intent classified internally
                 
                 # For task intents, engage orchestrator
                 if intent == "task" and self.user_valves.enable_orchestrator:
@@ -1185,20 +1197,35 @@ class Filter:
                         __event_emitter__,
                     )
             
-            # Search memory
-            source_type = "document" if chunks else "prompt"
-            
-            if chunks:
-                source_name = filenames[0] if filenames else "attachment"
-            else:
-                content = messages[-1].get("content", "") if messages else ""
-                source_name = (
-                    (str(content)[:50] + "...") if len(str(content)) > 50 else str(content)
-                )
-            
-            status, context = await _search_memory(
-                user_id, messages, model, metadata, source_type, source_name
+            # Skip memory operations for file/workspace tasks
+            # These are operational commands, not info to remember
+            is_file_operation = orchestrator_context and any(
+                marker in orchestrator_context for marker in [
+                    "### Workspace Files ###",
+                    "### File Content ###", 
+                    "### File Operation Result ###",
+                    "### Workspace Error ###",
+                ]
             )
+            
+            # Search memory (skip for file operations)
+            status = "skipped"
+            context = []
+            
+            if not is_file_operation:
+                source_type = "document" if chunks else "prompt"
+                
+                if chunks:
+                    source_name = filenames[0] if filenames else "attachment"
+                else:
+                    content = messages[-1].get("content", "") if messages else ""
+                    source_name = (
+                        (str(content)[:50] + "...") if len(str(content)) > 50 else str(content)
+                    )
+                
+                status, context = await _search_memory(
+                    user_id, messages, model, metadata, source_type, source_name
+                )
             
             # Merge immediate image context
             if immediate_image_context:
@@ -1215,34 +1242,19 @@ class Filter:
             if has_context:
                 memory_count = len(context) if context else 0
                 
-                if orchestrator_context:
+                if memory_count > 0:
                     await __event_emitter__({
                         "type": "status",
                         "data": {
-                            "description": f"🧠 Analysis ready + {memory_count} memories",
+                            "description": f"📚 {memory_count} relevant memories",
                             "done": False,
                             "hidden": False,
                         }
-                    })
-                else:
-                    await __event_emitter__({
-                        "type": "status",
-                        "data": {
-                            "description": f"🧠 Found {memory_count} memories",
-                            "done": False,
-                            "hidden": False,
-                        }
-                    })
-                
-                for ctx in (context or [])[:3]:
-                    await __event_emitter__({
-                        "type": "status",
-                        "data": {"description": f"  • {_format_source(ctx)}", "done": False, "hidden": False}
                     })
                 
                 await __event_emitter__({
                     "type": "status",
-                    "data": {"description": "🎩 Ready to assist", "done": True, "hidden": False}
+                    "data": {"description": "✅ Ready", "done": True, "hidden": False}
                 })
                 
                 body = self._inject_context(body, context or [], orchestrator_context)
@@ -1250,19 +1262,19 @@ class Filter:
             elif status == "saved":
                 await __event_emitter__({
                     "type": "status",
-                    "data": {"description": "🧠 Memory saved", "done": True, "hidden": False}
+                    "data": {"description": "💾 Saved to memory", "done": True, "hidden": False}
                 })
             
             elif status == "skipped":
                 await __event_emitter__({
                     "type": "status",
-                    "data": {"description": "🎩 Ready", "done": True, "hidden": True}
+                    "data": {"description": "✅ Ready", "done": True, "hidden": True}
                 })
             
             else:
                 await __event_emitter__({
                     "type": "status",
-                    "data": {"description": f"🎩 {status}", "done": True, "hidden": False}
+                    "data": {"description": "✅ Ready", "done": True, "hidden": False}
                 })
             
             print(f"[jeeves] user={user_id} intent={intent_result.get('intent')} status={status} context={len(context or [])} chunks={chunks_saved}")
@@ -1278,6 +1290,69 @@ class Filter:
             
             return body
     
-    async def outlet(self, body: dict, __event_emitter__, __user__: Optional[dict] = None) -> None:
-        """Post-response hook. Could save assistant responses to memory."""
-        pass
+    async def outlet(self, body: dict, __event_emitter__, __user__: Optional[dict] = None) -> dict:
+        """
+        Post-response hook. Formats assistant responses for consistency.
+        
+        Ensures:
+        - File/folder names are in `backticks`
+        - Code references are in `backticks`
+        - Lists and code blocks use fenced markdown
+        """
+        messages = body.get("messages", [])
+        if not messages:
+            return body
+        
+        # Find last assistant message
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "assistant":
+                content = messages[i].get("content", "")
+                if isinstance(content, str):
+                    messages[i]["content"] = self._format_response(content)
+                break
+        
+        body["messages"] = messages
+        return body
+    
+    def _format_response(self, text: str) -> str:
+        """
+        Format response text for better markdown rendering.
+        
+        - Wrap file/folder names in backticks
+        - Wrap code references in backticks
+        - Ensure code blocks are fenced
+        """
+        import re
+        
+        # Skip if already well-formatted or empty
+        if not text or text.startswith("```"):
+            return text
+        
+        # Pattern for file paths and names (with extensions or path separators)
+        # Match paths like: file.py, /path/to/file, ./folder, layers/executor/main.py
+        file_pattern = r'(?<![`\w])([./\\]?[\w\-]+(?:[/\\][\w\-\.]+)+\.?\w*|[\w\-]+\.\w{1,10})(?![`\w])'
+        
+        def wrap_if_not_wrapped(match):
+            path = match.group(1)
+            # Don't wrap if it looks like a URL or already wrapped
+            if path.startswith('http') or path.startswith('`'):
+                return match.group(0)
+            return f'`{path}`'
+        
+        # Apply file path formatting (but not inside code blocks)
+        lines = text.split('\n')
+        formatted_lines = []
+        in_code_block = False
+        
+        for line in lines:
+            if line.strip().startswith('```'):
+                in_code_block = not in_code_block
+                formatted_lines.append(line)
+            elif in_code_block:
+                formatted_lines.append(line)
+            else:
+                # Format file paths outside code blocks
+                formatted_line = re.sub(file_pattern, wrap_if_not_wrapped, line)
+                formatted_lines.append(formatted_line)
+        
+        return '\n'.join(formatted_lines)
