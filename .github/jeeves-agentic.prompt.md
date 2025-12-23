@@ -1,5 +1,7 @@
 # Plan: Jeeves Redesign – Multi-Faceted AI Agentic & Reasoning Engine (REFINED)
 
+> **Note:** This is the original design document used to plan the Jeeves architecture. For current implementation details, see [ARCHITECTURE.md](../ARCHITECTURE.md) and [README.md](../README.md).
+
 Jeeves transforms from a passive memory layer into an active reasoning and execution engine with **contextual parallelization**. Workspace-scoped, permission-gated, batch-wise parallel execution for independent tasks.
 
 ## Key Refinements from Original Plan

@@ -371,20 +371,149 @@ async def _orchestrate_task(
     Returns context string to inject into conversation.
     """
     user_text = _extract_user_text_prompt(messages) or ""
-    user_text = user_text.lower()
+    original_user_text = user_text  # Keep original case for content extraction
+    user_text_lower = user_text.lower()
     
     # Direct execution for common workspace operations
     if workspace_root:
-        # List files request - expanded patterns including summarize/analyze context
+        
+        # ================================================================
+        # EDIT OPERATIONS - Check these FIRST before read/list!
+        # ================================================================
+        # Detect edit intent: add/insert/append/update/edit + file reference
+        edit_verbs = r'(?:add|insert|append|put|write|include|create)'
+        file_refs = r'(?:readme|architecture|docker-compose|\w+\.\w+)'
+        
+        edit_intent_match = re.search(
+            rf'{edit_verbs}\s+(?:a\s+)?(.+?)\s+(?:to|in|into)\s+(?:the\s+)?(?:file\s+)?({file_refs})',
+            original_user_text,
+            re.IGNORECASE
+        )
+        
+        if edit_intent_match:
+            content_description = edit_intent_match.group(1).strip()
+            file_ref = edit_intent_match.group(2).strip()
+            
+            # Normalize file references
+            file_ref_lower = file_ref.lower()
+            if "readme" in file_ref_lower:
+                target_file = "README.md"
+            elif "architecture" in file_ref_lower:
+                target_file = "ARCHITECTURE.md"
+            elif "docker-compose" in file_ref_lower or "docker compose" in file_ref_lower:
+                target_file = "docker-compose.yaml"
+            elif "gitignore" in file_ref_lower:
+                target_file = ".gitignore"
+            else:
+                target_file = file_ref
+            
+            target_path = f"{workspace_root}/{target_file}"
+            
+            await __event_emitter__({
+                "type": "status",
+                "data": {"description": f"✏️ Editing {target_file}...", "done": False, "hidden": False}
+            })
+            
+            # For natural language requests, construct the content
+            if "credit" in content_description.lower():
+                # Get user's name from memories if available
+                user_name = "Ian"  # TODO: extract from memory context
+                content_to_add = f"\n\n## Credits\n\n- **{user_name}** - Creator and maintainer\n"
+            elif "contributor" in content_description.lower():
+                user_name = "Ian"
+                content_to_add = f"\n\n## Contributors\n\n- **{user_name}**\n"
+            else:
+                # Use the description as content
+                content_to_add = f"\n{content_description}\n"
+            
+            success, msg = _append_to_workspace_file(workspace_root, target_path, content_to_add)
+            
+            if success:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": f"✅ Updated {target_file}", "done": True, "hidden": False}
+                })
+                
+                # Read back to show result
+                new_content = _read_workspace_file(workspace_root, target_path, max_lines=50)
+                
+                return f"""### File Operation Result ###
+**Operation:** Append to {target_file}
+**Status:** ✅ Success
+**Added:**
+```
+{content_to_add}
+```
+
+**Updated file (last 50 lines):**
+```
+{new_content or "(unable to read back)"}
+```
+### End File Operation ###
+
+"""
+            else:
+                return f"""### File Operation Result ###
+**Operation:** Append to {target_file}
+**Status:** ❌ Failed
+**Error:** {msg}
+### End File Operation ###
+
+"""
+        
+        # Pattern: Replace "X" with "Y" in file.txt
+        replace_match = re.search(
+            r'replace\s+["\'](.+?)["\']\s+with\s+["\'](.+?)["\']\s+in\s+(?:the\s+)?(?:file\s+)?["\']?(\w+\.\w+)["\']?',
+            original_user_text,
+            re.IGNORECASE | re.DOTALL
+        )
+        
+        if replace_match:
+            old_text = replace_match.group(1)
+            new_text = replace_match.group(2)
+            target_file = replace_match.group(3)
+            target_path = f"{workspace_root}/{target_file}"
+            
+            await __event_emitter__({
+                "type": "status",
+                "data": {"description": f"✏️ Replacing in {target_file}...", "done": False, "hidden": False}
+            })
+            
+            success, msg = _replace_in_workspace_file(workspace_root, target_path, old_text, new_text)
+            
+            if success:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": f"✅ Updated {target_file}", "done": True, "hidden": False}
+                })
+                
+                return f"""### File Operation Result ###
+**Operation:** Replace in {target_file}
+**Status:** ✅ Success
+**Changed:** `{old_text}` → `{new_text}`
+### End File Operation ###
+
+"""
+            else:
+                return f"""### File Operation Result ###
+**Operation:** Replace in {target_file}
+**Status:** ❌ Failed
+**Error:** {msg}
+### End File Operation ###
+
+"""
+        
+        # ================================================================
+        # READ OPERATIONS - Only if not an edit request
+        # ================================================================
+        # List files request - but exclude edit verbs
         list_keywords = [
             "list files", "show files", "what files", "list the files", "files in",
             "summarize", "analyze", "read the", "look at the", "check the",
             "what's in", "whats in", "contents of", "structure of",
-            # Edit/modify patterns - need to read first
-            "add to", "edit the", "modify", "update the", "change the",
-            "readme", "architecture", "docker-compose"
+            "show me the readme", "show me the architecture"
         ]
-        if any(kw in user_text for kw in list_keywords):
+        if any(kw in user_text_lower for kw in list_keywords):
             await __event_emitter__({
                 "type": "status",
                 "data": {"description": "📂 Listing workspace files...", "done": False, "hidden": False}
@@ -408,7 +537,7 @@ async def _orchestrate_task(
 """]
                 
                 # If user asked to read/show specific files, also read key documentation files
-                if any(kw in user_text for kw in ["summarize", "analyze", "read the", "look at", "show me", "print the", "display the", "readme", "architecture"]):
+                if any(kw in user_text_lower for kw in ["summarize", "analyze", "read the", "look at", "show me", "print the", "display the", "readme", "architecture"]):
                     doc_files = ["README.md", "ARCHITECTURE.md", "docker-compose.yaml"]
                     for doc in doc_files:
                         doc_path = f"{workspace_root}/{doc}"
@@ -441,7 +570,7 @@ The executor service may not be running or the path may not exist.
         
         # Read file request - require explicit file path patterns
         # Must have file extension or path separator to avoid matching phrases like "read each"
-        file_read_match = re.search(r'(?:read|show|display|cat|open)\s+(?:the\s+)?(?:file\s+)?["\']?([^\s"\']+\.[a-zA-Z0-9]+|/[^\s"\']+)["\']?', user_text)
+        file_read_match = re.search(r'(?:read|show|display|cat|open)\s+(?:the\s+)?(?:file\s+)?["\']?([^\s"\']+\.[a-zA-Z0-9]+|/[^\s"\']+)["\']?', user_text_lower)
         if file_read_match:
             filepath = file_read_match.group(1)
             
@@ -463,113 +592,6 @@ The executor service may not be running or the path may not exist.
 {content}
 ```
 ### End File Content ###
-
-"""
-        
-        # ================================================================
-        # File Write/Edit Operations - Parse structured edit requests
-        # ================================================================
-        # Look for edit patterns in original (not lowercased) text
-        original_user_text = _extract_user_text_prompt(messages) or ""
-        
-        # Pattern: "add X to the readme" or "add X to file.txt"
-        add_match = re.search(
-            r'add\s+["\']?(.+?)["\']?\s+(?:to\s+)?(?:the\s+)?(?:end\s+of\s+)?(?:file\s+)?["\']?(\w+\.\w+)["\']?',
-            original_user_text,
-            re.IGNORECASE | re.DOTALL
-        )
-        
-        if add_match:
-            content_to_add = add_match.group(1).strip()
-            target_file = add_match.group(2)
-            
-            # Find full path
-            target_path = f"{workspace_root}/{target_file}"
-            
-            await __event_emitter__({
-                "type": "status",
-                "data": {"description": f"✏️ Appending to {target_file}...", "done": False, "hidden": False}
-            })
-            
-            # Ensure it ends with newline
-            if not content_to_add.endswith("\n"):
-                content_to_add = "\n" + content_to_add + "\n"
-            
-            success, msg = _append_to_workspace_file(workspace_root, target_path, content_to_add)
-            
-            if success:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {"description": f"✅ Updated {target_file}", "done": True, "hidden": False}
-                })
-                
-                # Read back the file to show the result
-                new_content = _read_workspace_file(workspace_root, target_path, max_lines=50)
-                
-                return f"""### File Operation Result ###
-**Operation:** Append to {target_file}
-**Status:** ✅ Success
-**Added:**
-```
-{content_to_add}
-```
-
-**Updated file content:**
-```
-{new_content or "(unable to read back)"}
-```
-### End File Operation ###
-
-"""
-            else:
-                return f"""### File Operation Result ###
-**Operation:** Append to {target_file}
-**Status:** ❌ Failed
-**Error:** {msg}
-### End File Operation ###
-
-"""
-        
-        # Pattern: Replace "X" with "Y" in file.txt
-        replace_match = re.search(
-            r'replace\s+["\'](.+?)["\']\s+with\s+["\'](.+?)["\']\s+in\s+(?:file\s+)?["\']?(\w+\.\w+)["\']?',
-            original_user_text,
-            re.IGNORECASE | re.DOTALL
-        )
-        
-        if replace_match:
-            old_text = replace_match.group(1)
-            new_text = replace_match.group(2)
-            target_file = replace_match.group(3)
-            target_path = f"{workspace_root}/{target_file}"
-            
-            await __event_emitter__({
-                "type": "status",
-                "data": {"description": f"✏️ Editing {target_file}...", "done": False, "hidden": False}
-            })
-            
-            success, msg = _replace_in_workspace_file(workspace_root, target_path, old_text, new_text)
-            
-            if success:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {"description": f"✅ Updated {target_file}", "done": True, "hidden": False}
-                })
-                
-                return f"""### File Operation Result ###
-**Operation:** Replace in {target_file}
-**Status:** ✅ Success
-**Changed:** `{old_text}` → `{new_text}`
-**Result:** {msg}
-### End File Operation ###
-
-"""
-            else:
-                return f"""### File Operation Result ###
-**Operation:** Replace in {target_file}
-**Status:** ❌ Failed
-**Error:** {msg}
-### End File Operation ###
 
 """
     

@@ -2,602 +2,442 @@
 
 ## Overview
 
-Jeeves is a semantic memory system for Open-WebUI that captures conversation context, embeds it with `sentence-transformers`, and stores it in **Qdrant** vector database. The system consists of three microservices:
+Jeeves is an agentic AI assistant for Open-WebUI that provides:
 
-1. **Memory API** — Conversation memory storage and retrieval (port 8000)
-2. **Extractor API** — Media-to-text extraction (images, audio, PDF, code) (port 8002)
-3. **Pragmatics API** — Intent classification (save vs. other) (port 8002)
-4. **Qdrant** — Vector database for semantic search (port 6333)
+- **Semantic Memory** — Stores and retrieves conversation context via Qdrant
+- **Intent Classification** — 4-class DistilBERT model (casual/save/recall/task)
+- **Workspace Operations** — Read, list, and edit files in mounted workspace
+- **Surgical File Editing** — Replace, insert, append operations
 
 ---
 
 ## System Architecture
 
-```mermaid
-flowchart TB
-    subgraph User["Open-WebUI (User)"]
-        UserInput["User sends message"]
-        UserReads["User reads response"]
-    end
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           Open-WebUI (8180)                             │
+│                                  │                                      │
+│                    ┌─────────────┴─────────────┐                        │
+│                    │    jeeves.filter.py       │                        │
+│                    │  (inlet/outlet hooks)     │                        │
+│                    └─────────────┬─────────────┘                        │
+└─────────────────────────────────┬───────────────────────────────────────┘
+                                  │
+           ┌──────────────────────┼──────────────────────┐
+           │                      │                      │
+           ▼                      ▼                      ▼
+    ┌─────────────┐       ┌─────────────┐       ┌─────────────┐
+    │ Pragmatics  │       │   Jeeves    │       │  Executor   │
+    │    8001     │       │    8000     │       │    8005     │
+    │             │       │             │       │             │
+    │ 4-class     │       │ Memory API  │       │ File Ops    │
+    │ Intent      │       │ /save       │       │ /tool       │
+    │ Classifier  │       │ /search     │       │ /file       │
+    └─────────────┘       └──────┬──────┘       └─────────────┘
+                                 │
+                                 ▼
+                          ┌─────────────┐
+                          │   Qdrant    │
+                          │    6333     │
+                          │             │
+                          │ Vector DB   │
+                          │ 768-dim     │
+                          └─────────────┘
+```
 
-    subgraph Filter["Filter.inlet() - memory.filter.py"]
-        F1["1. Extract files/images"]
-        F2["2. Save chunks to memory"]
-        F3["3. Search for context"]
-        F4["4. Inject into request"]
-    end
+---
 
-    subgraph MemoryAPI["Memory API (FastAPI)"]
-        direction TB
-        Routes["Routes: /save, /search, /summaries"]
-        M1["1. Receive chunks from filter"]
-        M2["2. Classify importance"]
-        M3["3. Embed with SentenceTransformer"]
-        M4["4. Upsert to Qdrant"]
-        M5["5. Search for existing context"]
-        M6["6. Return context + status"]
-    end
+## Services
 
-    subgraph Qdrant["Qdrant Vector Database"]
-        QConfig["Collection: user_memory_collection<br/>Dimension: 768 (all-mpnet-base-v2)<br/>Similarity: COSINE<br/>Threshold: 0.35"]
-    end
+### 1. Jeeves Filter (filters/jeeves.filter.py)
 
-    subgraph Support["Support Services"]
-        Pragmatics["Pragmatics Classifier<br/>Save vs Other Intent<br/>(0.70 threshold)"]
-        Extractor["Extractor API<br/>• Image → LLaVA<br/>• Audio → Whisper<br/>• PDF → PyMuPDF<br/>• Code → Chunker"]
-    end
+The main entry point running inside Open-WebUI.
 
-    LLM["LLM Response"]
+**Responsibilities:**
 
-    UserInput --> Filter
-    Filter --> MemoryAPI
-    MemoryAPI -->|"Embedding"| Qdrant
-    MemoryAPI -->|"Search/Upsert"| Qdrant
-    MemoryAPI --> Pragmatics
-    Filter --> Extractor
-    Extractor -->|"Chunks"| MemoryAPI
-    MemoryAPI -->|"Context injected"| LLM
-    LLM --> UserReads
+- Classify user intent via Pragmatics API
+- Detect edit patterns (insert/add/replace) and execute via Executor
+- Search memory for relevant context
+- Inject context and results into LLM conversation
+
+**Pattern Priority (checked in order):**
+
+```python
+1. Edit patterns     → Execute write via Executor API
+2. Read patterns     → Read file, return content
+3. List patterns     → Scan workspace, return listing
+4. Orchestrator      → Multi-step task planning
+5. Memory search     → Retrieve relevant memories
+```
+
+**Edit Pattern Detection:**
+
+```python
+# Supported patterns:
+"insert X in readme"          → append_to_file(README.md)
+"add X to README.md"          → append_to_file(README.md)
+"replace 'X' with 'Y' in F"   → replace_in_file(F, X, Y)
+```
+
+---
+
+### 2. Pragmatics API (Port 8001)
+
+4-class intent classification using fine-tuned DistilBERT.
+
+**Model:** `distilbert_intent` (98% validation accuracy)
+
+**Classes:**
+
+| Class    | ID  | Description                   | Example                 |
+| -------- | --- | ----------------------------- | ----------------------- |
+| `casual` | 0   | General chat, no action       | "How are you?"          |
+| `save`   | 1   | User sharing info to remember | "My name is Ian"        |
+| `recall` | 2   | User asking about past info   | "What's my email?"      |
+| `task`   | 3   | User requesting action        | "Add credits to readme" |
+
+**Endpoint:**
+
+```
+POST /api/pragmatics/classify
+Input:  { "text": "insert a credit in the readme" }
+Output: { "intent": "task", "confidence": 0.99, "label": 3 }
+```
+
+---
+
+### 3. Executor API (Port 8005)
+
+Polyglot code execution and file operations with sandbox enforcement.
+
+**File Operations:**
+
+| Tool              | Method                    | Description           |
+| ----------------- | ------------------------- | --------------------- |
+| `read_file`       | `read(path)`              | Read file contents    |
+| `write_file`      | `write(path, content)`    | Overwrite entire file |
+| `replace_in_file` | `replace(path, old, new)` | Surgical find/replace |
+| `insert_in_file`  | `insert(path, pos, text)` | Insert at position    |
+| `append_to_file`  | `append(path, content)`   | Add to end of file    |
+| `list_files`      | `list_dir(path)`          | Directory listing     |
+| `scan_workspace`  | `scan(path, pattern)`     | Recursive glob search |
+
+**Positions for insert_in_file:**
+
+- `start` — Beginning of file
+- `end` — End of file
+- `before` — Before anchor text
+- `after` — After anchor text
+
+**Endpoint:**
+
+```
+POST /api/execute/tool
+Input: {
+  "tool": "replace_in_file",
+  "params": {
+    "path": "/workspace/README.md",
+    "old_text": "TODO",
+    "new_text": "DONE"
+  },
+  "workspace_context": {
+    "workspace_root": "/workspace",
+    "cwd": "/workspace",
+    "allow_file_write": true
+  }
+}
+Output: { "success": true, "output": "Replaced 3 occurrence(s)" }
+```
+
+**Permission Checks:**
+
+- `allow_file_write` — Required for write/replace/insert/append/delete
+- `allow_shell_commands` — Required for shell execution
+- `allow_code_execution` — Required for Python/Node/PowerShell
+
+---
+
+### 4. Memory API (Port 8000)
+
+Semantic memory storage and retrieval.
+
+**Components:**
+
+- **Embedder:** SentenceTransformer `all-mpnet-base-v2` (768-dim, L2-normalized)
+- **Storage:** Qdrant vector database
+- **Summarizer:** DistilBART (optional)
+- **Fact Extractor:** KeyBERT + regex for importance filtering
+
+**Endpoints:**
+
+```
+POST /api/memory/save
+  - Check importance (skip casual queries)
+  - Embed with SentenceTransformer
+  - Upsert to Qdrant
+  - Return existing_context
+
+POST /api/memory/search
+  - Embed query
+  - Search Qdrant (threshold: 0.35)
+  - Return matching memories
+
+GET /api/jeeves/filter
+  - Serve filter source code
+```
+
+---
+
+### 5. Extractor API (Port 8002)
+
+Media-to-text extraction (GPU-accelerated).
+
+**Models:**
+
+- **Image:** LLaVA-1.5-7B (4-bit) or Florence-2 fallback
+- **Audio:** Whisper (base model)
+- **PDF:** PyMuPDF
+
+---
+
+### 6. Orchestrator API (Port 8004)
+
+Multi-step reasoning and task planning (under development).
+
+**Endpoints:**
+
+```
+POST /api/orchestrator/set-workspace
+POST /api/orchestrator/next-step
+POST /api/orchestrator/execute-batch
 ```
 
 ---
 
 ## Data Flow
 
-### 1. User sends message with attachment
+### Edit Request Flow
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant User
-    participant WebUI as Open-WebUI
-    participant Filter as Filter.inlet()
-    participant Extractor as Extractor API
-    participant Memory as Memory API
-    participant LLM
-
-    User->>WebUI: Send message + attachment
-    WebUI->>Filter: Process request
-
-    rect rgb(230, 245, 255)
-        Note over Filter,Extractor: Step 1: Extract
-        Filter->>Extractor: Image URLs, file uploads
-        Extractor-->>Filter: Text chunks + metadata
-    end
-
-    rect rgb(230, 255, 230)
-        Note over Filter,Memory: Step 2: Save Chunks
-        Filter->>Memory: POST /api/memory/save (each chunk)
-        Memory-->>Filter: Status: saved | saved_with_context | skipped
-    end
-
-    rect rgb(255, 245, 230)
-        Note over Filter,Memory: Step 3: Search Memory
-        Filter->>Memory: POST /api/memory/save (user message)
-        Memory-->>Filter: existing_context (past messages)
-    end
-
-    rect rgb(245, 230, 255)
-        Note over Filter: Step 4: Inject Context
-        Filter->>Filter: Prepend context to message
-    end
-
-    Filter->>LLM: Modified request
-    LLM-->>User: Response with context
+```
+User: "insert a credit to me in the readme"
+                    │
+                    ▼
+┌─────────────────────────────────────────┐
+│        jeeves.filter.py inlet()         │
+│                                         │
+│  1. Classify intent → "task" (99%)      │
+│  2. Match edit pattern:                 │
+│     "insert" + "credit" + "readme"      │
+│  3. Normalize file → README.md          │
+│  4. Build content:                      │
+│     "## Credits\n- Ian - Creator"       │
+└─────────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────┐
+│         Executor API (8005)             │
+│                                         │
+│  POST /api/execute/tool                 │
+│  tool: "append_to_file"                 │
+│  path: "/workspace/jeeves/README.md"    │
+│  content: "## Credits\n- Ian..."        │
+└─────────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────┐
+│        Filter injects result            │
+│                                         │
+│  "### File Operation Result ###         │
+│   Operation: Append to README.md        │
+│   Status: ✅ Success                    │
+│   Added: ## Credits..."                 │
+└─────────────────────────────────────────┘
+                    │
+                    ▼
+         LLM confirms edit done
 ```
 
-### 2. Memory save flow
+### Memory Search Flow
 
-```mermaid
-flowchart TB
-    Start(["Filter submits chunk"]) --> Parse
-
-    subgraph Step1["1. Parse Request"]
-        Parse["Parse user_id, messages, source_type"]
-    end
-
-    subgraph Step2["2. Check Importance"]
-        Extract["Extract text from content"]
-        KeyBERT["KeyBERT + heuristics"]
-        Decision{"Important?"}
-        Extract --> KeyBERT --> Decision
-    end
-
-    subgraph Step3["3. Embed"]
-        Embed["SentenceTransformer<br/>all-mpnet-base-v2<br/>768-dim, L2-normalized<br/>~50ms"]
-    end
-
-    subgraph Step4["4. Summarize (optional)"]
-        Summary["distilbart-cnn-12-6<br/>CPU or GPU"]
-    end
-
-    subgraph Step5["5. Upsert to Qdrant"]
-        Upsert["ID: UUID(user_id, hash)<br/>Vector: 768-dim<br/>Metadata + Payload"]
-    end
-
-    subgraph Step6["6. Search Context"]
-        Search["Query Qdrant<br/>Threshold: 0.35<br/>Top-k: 5"]
-    end
-
-    subgraph Step7["7. Return"]
-        Return["Status + Context"]
-    end
-
-    Parse --> Step2
-    Decision -->|"Casual/musing"| Skip(["skipped"])
-    Decision -->|"Important"| Step3
-    Step3 --> Step4 --> Step5 --> Step6 --> Step7
-    Return --> Response(["Response to filter"])
 ```
-
-### 3. Context injection
-
-```mermaid
-flowchart LR
-    subgraph QdrantResults["Qdrant Search Results"]
-        R1["user_text: CI/CD setup...<br/>source_type: prompt"]
-        R2["user_text: [Image]: Dashboard...<br/>source_type: image"]
-    end
-
-    subgraph Formatter["Format for Injection"]
-        Header["### Previous conversation context ###"]
-        Item1["- I need to set up CI/CD..."]
-        Item2["- [Image]: The dashboard shows..."]
-        Footer["### End of context ###"]
-        UserMsg["[User's current message]"]
-    end
-
-    subgraph Output["Final Message"]
-        LLM["LLM receives full context"]
-    end
-
-    QdrantResults --> Formatter --> Output
-```
-
-**Example context payload:**
-
-```json
-[
-  {
-    "user_text": "I need to set up CI/CD for our Python project",
-    "summary": "User asked about CI/CD setup for Python...",
-    "source_type": "prompt",
-    "source_name": "~30 words from user prompt"
-  },
-  {
-    "user_text": "[Image]: The dashboard shows...",
-    "source_type": "image",
-    "source_name": "uploaded_image_0"
-  }
-]
+User: "What's my name?"
+         │
+         ▼
+┌─────────────────────────────────────────┐
+│  1. Classify intent → "recall"          │
+│  2. Search memory API                   │
+│     query: "what's my name"             │
+│     top_k: 5                            │
+└─────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────┐
+│         Qdrant Search                   │
+│                                         │
+│  Embed query → 768-dim vector           │
+│  Cosine similarity > 0.35               │
+│  Filter by user_id                      │
+│  Return: "My name is Ian" (score: 0.82) │
+└─────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────┐
+│  Context injected:                      │
+│  "### Memories ###                      │
+│   - My name is Ian                      │
+│   ### End Memories ###"                 │
+└─────────────────────────────────────────┘
+         │
+         ▼
+    LLM: "Your name is Ian"
 ```
 
 ---
 
-## Component Details
-
-### Memory API (`tools-api/memory/`)
-
-**Files:**
-
-- `main.py` — FastAPI app setup, middleware, health check
-- `api/memory.py` — Router with `/save` and `/search` endpoints
-- `services/embedder.py` — SentenceTransformer embedding
-- `services/qdrant_client.py` — Lazy singleton Qdrant connection
-- `services/summarizer.py` — Optional DistilBART summarization
-- `services/fact_extractor.py` — KeyBERT importance filtering
-- `memory.filter.py` — Open-WebUI filter plugin (669 lines, 8 sections)
-- `utils/schemas.py` — Pydantic models for request/response
-
-**Endpoints:**
-
-```
-POST /api/memory/save
-  Input: SaveRequest (user_id, messages, model, metadata, source_type)
-  Process:
-    1. Check importance (KeyBERT)
-    2. Embed with SentenceTransformer
-    3. Search Qdrant for similar context
-    4. Upsert to Qdrant
-    5. Optionally summarize
-  Output: {status, existing_context, summary}
-
-POST /api/memory/search
-  Input: SearchRequest (user_id, query_text, top_k)
-  Process:
-    1. Embed query with SentenceTransformer
-    2. Search Qdrant with score_threshold
-    3. Filter by user_id
-  Output: {results: [{user_text, summary, score, source}]}
-
-POST /api/memory/summaries
-  Input: SearchRequest
-  Output: {summaries: [{summary, score}]}
-
-GET /health
-  Output: {status, memory_api: ok, qdrant: ok}
-
-GET /api/memory/filter
-  Output: Source code of memory.filter.py (for Open-WebUI parsing)
-```
-
-**Configuration (Environment):**
-
-```
-QDRANT_HOST=qdrant                    # Qdrant service hostname
-QDRANT_PORT=6333                      # Qdrant HTTP port
-INDEX_NAME=user_memory_collection     # Collection name
-EMBEDDING_PROVIDER=sentence_transformers
-SUMMARY_MODEL=sshleifer/distilbart-cnn-12-6
-SUMMARY_DEVICE=cpu                    # cpu or 0,1,2,... for GPU
-HF_HOME=/models                       # HuggingFace cache directory
-STORE_VERBATIM=true|false             # Store full text alongside summaries
-```
-
----
-
-### Extractor API (`tools-api/extractor/`)
-
-**Purpose:** Extract text from media (images, audio, PDF, code)
-
-**Files:**
-
-- `main.py` — FastAPI app, startup model preloading
-- `api/extractor.py` — `/extract` endpoint, content-type routing
-- `services/image_extractor.py` — LLaVA or Florence image description
-- `services/audio_extractor.py` — Whisper transcription
-- `services/pdf_extractor.py` — PyMuPDF text extraction
-- `services/chunker.py` — Text segmentation by function/class/heading
-
-**Models:**
-
-```
-Image Extraction:
-  • LLaVA-1.5-7B (4-bit, ~4GB VRAM) — Default, lazy-loaded at startup
-  • Florence-2 (fallback if LLaVA unavailable)
-  • Query: "Describe this image in detail: [image]"
-
-Audio Transcription:
-  • Whisper (base model)
-  • Auto-detects language, returns full transcript
-
-PDF Extraction:
-  • PyMuPDF (fitz)
-  • OCR for scanned documents (if available)
-
-Code Chunking:
-  • Language-aware segmentation (Python, JavaScript, etc.)
-  • Chunks by function/class/import statements
-  • Preserves context (parent class, module)
-```
-
-**Endpoint:**
-
-```
-POST /api/extract
-  Input: {
-    content: "base64 or text",
-    content_type: "image/png|application/pdf|audio/mp3|text/plain",
-    source_name: "filename",
-    chunk_size: 500,
-    chunk_overlap: 50,
-    prompt: "optional guided prompt for images"
-  }
-  Output: {
-    chunks: [{
-      content: "extracted text",
-      chunk_index: 0,
-      chunk_type: "text|heading|function",
-      section_title: "optional"
-    }]
-  }
-```
-
-**Configuration:**
-
-```
-IMAGE_MODEL=llava-4bit|llava|florence
-HF_HOME=/models
-DEVICE=cuda|cpu
-```
-
----
-
-### Pragmatics API (`tools-api/pragmatics/`)
-
-**Purpose:** Binary intent classification (save vs. other)
-
-**Model:** DistilBERT fine-tuned for "save memory" intent
-
-- Training data: ~1300 examples (save/recall/other)
-- Threshold: 0.70 (conservative: prefers NOT saving when uncertain)
-- Latency: ~5ms per sample
-
-**Endpoint:**
-
-```
-POST /classify
-  Input: {user_id, messages, user_prompt}
-  Output: {
-    intent: "save",
-    confidence: 0.92,
-    keywords: ["ci/cd", "setup", "python"]
-  }
-```
-
----
-
-### Qdrant Vector Database
-
-**Configuration:**
-
-```
-Container: qdrant/qdrant:latest
-Ports:
-  - 6333 (HTTP API)
-  - 5100 (Web Dashboard UI)
-
-Collection: user_memory_collection
-  Vector Size: 768 (all-mpnet-base-v2)
-  Distance: COSINE
-  Storage: /qdrant/storage (mounted to C:/docker-data/qdrant/storage)
-
-Search Parameters:
-  - score_threshold: 0.35 (lowered from 0.45 for better recall)
-  - top_k: 5 (per search)
-  - filter: {key: 'user_id', match: {value: req.user_id}}
-```
-
----
-
-## Docker Architecture
-
-### Multi-stage Build Strategy
-
-Each service uses a **base image** on Docker Hub + thin app layer:
-
-```mermaid
-flowchart TB
-    subgraph DockerHub["Docker Hub (ianwesterfield/)"]
-        BaseMemory["jeeves-memory-base<br/>python:3.11-slim + deps"]
-        BaseExtractor["jeeves-extractor-base<br/>python:3.11-slim + torch"]
-        BasePragmatics["jeeves-pragmatics-base<br/>python:3.11-slim + deps"]
-    end
-
-    subgraph Local["Local Build (~30 sec)"]
-        AppMemory["memory_api<br/>FROM jeeves-memory-base<br/>COPY app code"]
-        AppExtractor["extractor_api<br/>FROM jeeves-extractor-base<br/>COPY app code"]
-        AppPragmatics["pragmatics_api<br/>FROM jeeves-pragmatics-base<br/>COPY app code"]
-    end
-
-    BaseMemory --> AppMemory
-    BaseExtractor --> AppExtractor
-    BasePragmatics --> AppPragmatics
-```
-
-**Build Performance:**
-
-| Scenario                       | Time    | Notes                              |
-| ------------------------------ | ------- | ---------------------------------- |
-| First build (with base images) | ~30 sec | Pulls base from Docker Hub         |
-| Code change only               | ~2 sec  | App layer rebuild only             |
-| Base image rebuild             | 35+ min | Only when requirements.txt changes |
-
-### Docker Compose
-
-**Memory API** (`tools-api/memory/docker-compose.yaml`):
-
-```yaml
-services:
-  memory_api:
-    build:
-      context: ..
-      dockerfile: memory/Dockerfile
-    environment: QDRANT_HOST=qdrant
-      QDRANT_PORT=6333
-      INDEX_NAME=user_memory_collection
-    ports: [8000:8000]
-    volumes: [C:/docker-data/models:/models]
-    networks: [webtools_network]
-```
-
-**Network:** External network `webtools_network` (shared with Ollama, Open-WebUI)
-
----
-
-## Integration with Open-WebUI
-
-### Filter Plugin Contract
-
-Open-WebUI calls filter at two points:
-
-**1. inlet (before LLM sees the message)**
-
-```python
-async def inlet(body: dict, __event_emitter__, __user__: dict):
-    # Extract files/images
-    # Search memory
-    # Inject context into body["messages"]
-    # Emit status events for UI
-    return modified_body
-```
-
-**2. outlet (after LLM response)**
-
-```python
-async def outlet(body: dict, __event_emitter__, __user__: dict):
-    # Currently no-op
-    # Could save assistant responses or update context
-    pass
-```
-
-### Status Events
-
-Filter emits UI updates as the process runs:
-
-```
-✨ Processing...          (initial)
-📄 Saving 5 chunks...     (during extraction)
-🧠 Found 3 memories       (after search)
-  • "Set up CI/CD..."
-  • 🖼 uploaded_image_0
-  • [Highlighted previous context]
-✔ Context injected        (done)
-```
-
----
-
-## Performance Metrics
-
-### Latency (per conversation turn)
-
-| Operation      | Time  | Notes                                    |
-| -------------- | ----- | ---------------------------------------- |
-| Extract images | 2-5s  | ~1s per image (LLaVA inference)          |
-| Extract PDF    | 1-3s  | Depends on pages                         |
-| Embed message  | 50ms  | SentenceTransformer                      |
-| Search Qdrant  | 100ms | Cosine similarity, top-5                 |
-| Filter total   | <10s  | (includes extraction, search, injection) |
-
-### Storage
-
-| Aspect                    | Size   | Notes              |
-| ------------------------- | ------ | ------------------ |
-| Model: all-mpnet-base-v2  | ~430MB | Embeddings         |
-| Model: distilbart-cnn     | ~250MB | Summarization      |
-| Model: LLaVA-1.5-7B       | ~4GB   | 4-bit quantized    |
-| Qdrant: per 1000 memories | ~50MB  | Vectors + metadata |
-
----
-
-## Deployment Notes
-
-### Prerequisites
-
-- Docker with GPU support (for LLaVA, optional for memory)
-- NVIDIA CUDA 12.1+ (if using GPU for image extraction)
-- 16GB+ RAM (8GB minimum, 16GB recommended)
-- 10GB+ disk space (for models)
+## Configuration
 
 ### Environment Variables
 
-**Memory API:**
+| Variable                      | Service               | Default             | Purpose                       |
+| ----------------------------- | --------------------- | ------------------- | ----------------------------- |
+| `HOST_WORKSPACE_PATH`         | Orchestrator/Executor | `C:/Code`           | Host directory for /workspace |
+| `QDRANT_HOST`                 | Jeeves                | `qdrant`            | Vector DB hostname            |
+| `QDRANT_PORT`                 | Jeeves                | `6333`              | Vector DB port                |
+| `CLASSIFIER_MODEL`            | Pragmatics            | `distilbert_intent` | Intent model name             |
+| `INTENT_CONFIDENCE_THRESHOLD` | Pragmatics            | `0.50`              | Min confidence for intent     |
+| `IMAGE_MODEL`                 | Extractor             | `llava-4bit`        | Vision model                  |
+| `WHISPER_MODEL`               | Extractor             | `base`              | Audio transcription model     |
 
-```bash
-export QDRANT_HOST=qdrant
-export QDRANT_PORT=6333
-export SUMMARY_DEVICE=cpu  # or 0 for GPU:0
-export STORE_VERBATIM=true
+### Docker Compose Services
+
+```yaml
+services:
+  jeeves: 8000 # Memory + Filter serving
+  pragmatics_api: 8001 # Intent classification
+  extractor_api: 8002 # Media extraction (GPU)
+  orchestrator_api: 8004 # Task planning
+  executor_api: 8005 # File ops + code execution
+  qdrant: 6333 # Vector database
+  ollama: 11434 # LLM inference
+  open-webui: 8180 # Chat UI
 ```
-
-**Extractor API:**
-
-```bash
-export IMAGE_MODEL=llava-4bit  # or llava, florence
-export DEVICE=cuda  # or cpu
-export HF_HOME=/models
-```
-
-### Startup Sequence
-
-1. Qdrant starts, initializes storage
-2. Memory API starts, connects to Qdrant, loads embedding model
-3. Extractor API starts, **preloads LLaVA at startup** (eliminates 8-12s first-request latency)
-4. Open-WebUI detects filter via `GET /.well-known/ai-plugin.json`
-5. First user message triggers extraction/memory flow
 
 ---
 
-## Key Decisions & Trade-offs
-
-| Decision                               | Rationale                                  | Trade-off                                               |
-| -------------------------------------- | ------------------------------------------ | ------------------------------------------------------- |
-| Cosine similarity (0.35 threshold)     | Better semantic matching, higher recall    | Some false positives (mitigated by relevance filtering) |
-| SentenceTransformer 768-dim            | Fast embedding, good quality               | Requires VRAM, ~430MB model                             |
-| LLaVA 4-bit quantization               | Fits in ~4GB VRAM                          | Slight quality loss (~5% accuracy)                      |
-| Qdrant over Pinecone/Weaviate          | Self-hosted, no API costs, flexible        | Requires management, backups                            |
-| DistilBERT for intent (0.70 threshold) | Conservative: avoid saving trivial queries | Misses some important context (acceptable trade-off)    |
-| Lazy model loading (except extractor)  | Reduces startup time                       | First image request slower (now preloaded)              |
-
----
-
-## Future Enhancements
-
-1. **Adaptive Threshold:** Dynamically adjust Qdrant threshold based on collection size and user feedback
-2. **Model Selection:** Allow users to choose embedding model (e.g., bge-large-en for better performance)
-3. **Multi-user Isolation:** Enhanced privacy controls per workspace
-4. **Context Summarization:** Compress old memories to reduce latency for large datasets
-5. **Duplicate Detection:** Avoid storing near-duplicate memories
-6. **Feedback Loop:** User ratings of injected context to improve ranking
-
----
-
-## Quick Reference
-
-### Endpoints
-
-| Service    | Method | Route                   | Purpose         |
-| ---------- | ------ | ----------------------- | --------------- |
-| Memory     | POST   | `/api/memory/save`      | Save + search   |
-| Memory     | POST   | `/api/memory/search`    | Search only     |
-| Memory     | POST   | `/api/memory/summaries` | Get summaries   |
-| Memory     | GET    | `/health`               | Health check    |
-| Extractor  | POST   | `/api/extract`          | Extract text    |
-| Pragmatics | POST   | `/classify`             | Classify intent |
-
-### Key Files
+## File Structure
 
 ```
-c:\Code\jeeves\
-├── tools-api/
+jeeves/
+├── docker-compose.yaml
+├── filters/
+│   └── jeeves.filter.py          # Main Open-WebUI filter
+├── layers/
 │   ├── memory/
-│   │   ├── main.py              ← FastAPI app
-│   │   ├── api/memory.py        ← /save, /search routes
-│   │   ├── memory.filter.py     ← Open-WebUI filter (669 lines, 8 sections)
-│   │   ├── services/
-│   │   │   ├── embedder.py      ← SentenceTransformer
-│   │   │   ├── qdrant_client.py ← Qdrant singleton
-│   │   │   └── summarizer.py    ← DistilBART
-│   │   └── Dockerfile           ← 3-layer caching
+│   │   ├── main.py               # FastAPI app
+│   │   ├── api/memory.py         # /save, /search endpoints
+│   │   └── services/
+│   │       ├── embedder.py       # SentenceTransformer
+│   │       ├── qdrant_client.py  # Qdrant connection
+│   │       └── summarizer.py     # DistilBART
+│   ├── pragmatics/
+│   │   ├── server.py             # FastAPI app
+│   │   ├── services/classifier.py # DistilBERT 4-class
+│   │   └── static/distilbert_intent/  # Trained model
 │   ├── extractor/
-│   │   ├── main.py              ← Startup model preloading
-│   │   ├── api/extractor.py     ← /extract endpoint
-│   │   ├── services/
-│   │   │   ├── image_extractor.py  ← LLaVA/Florence
-│   │   │   └── audio_extractor.py  ← Whisper
-│   │   └── Dockerfile
-│   └── pragmatics/
-│       ├── server.py            ← /classify endpoint
-│       ├── services/
-│       │   └── classifier.py    ← DistilBERT
-│       └── Dockerfile
-└── ARCHITECTURE.md              ← This file
+│   │   ├── main.py
+│   │   └── services/
+│   │       ├── image_extractor.py  # LLaVA/Florence
+│   │       └── audio_extractor.py  # Whisper
+│   ├── orchestrator/
+│   │   ├── main.py
+│   │   └── services/
+│   │       ├── reasoning_engine.py
+│   │       └── task_planner.py
+│   └── executor/
+│       ├── main.py
+│       ├── api/executor.py       # /tool endpoint
+│       └── services/
+│           ├── file_handler.py   # read/write/replace/insert/append
+│           ├── polyglot_handler.py # Python/Node/PowerShell
+│           └── shell_handler.py
+└── .github/
+    └── copilot-instructions.md
 ```
 
 ---
 
-## Related Documentation
+## Security
 
-- `.github/copilot-instructions.md` — Detailed operational guidelines
-- `README.md` — Setup and usage instructions
-- Individual service Dockerfiles — Build details and dependencies
+### Workspace Sandbox
+
+- All file operations validate paths against `workspace_root`
+- Paths outside workspace are rejected
+- Write operations require explicit `allow_file_write: true`
+
+### Permission Flags
+
+```python
+class WorkspaceContext:
+    workspace_root: str       # Sandbox boundary
+    cwd: str                  # Current directory
+    allow_file_write: bool    # Enable write operations
+    allow_shell_commands: bool # Enable shell execution
+    allow_code_execution: bool # Enable code runners
+    allowed_languages: List[str] # Permitted languages
+```
+
+---
+
+## Development
+
+### Filter Sync
+
+After editing `filters/jeeves.filter.py`, sync to Open-WebUI:
+
+```powershell
+python -c "
+import requests
+f = open('filters/jeeves.filter.py', encoding='utf-8').read()
+r = requests.post(
+    'http://localhost:8180/api/v1/functions/id/api/update',
+    headers={'Authorization':'Bearer YOUR_API_KEY'},
+    json={'id':'api','name':'Jeeves','content':f,'meta':{'toggle':True}},
+    timeout=30
+)
+print(f'Status: {r.status_code}')
+"
+```
+
+### Rebuild Services
+
+```powershell
+# Rebuild executor after code changes
+docker compose build --no-cache executor_api
+docker compose up -d executor_api
+
+# Rebuild all
+docker compose up -d --build
+```
+
+### Test Endpoints
+
+```powershell
+# Intent classification
+Invoke-RestMethod -Uri 'http://localhost:8001/api/pragmatics/classify' `
+  -Method Post -ContentType 'application/json' `
+  -Body '{"text":"add credits to readme"}'
+
+# File append
+Invoke-RestMethod -Uri 'http://localhost:8005/api/execute/tool' `
+  -Method Post -ContentType 'application/json' `
+  -Body (@{
+    tool='append_to_file'
+    params=@{path='/workspace/test.txt';content='Hello'}
+    workspace_context=@{workspace_root='/workspace';cwd='/workspace';allow_file_write=$true}
+  } | ConvertTo-Json -Depth 5)
+
+# Memory search
+Invoke-RestMethod -Uri 'http://localhost:8000/api/memory/search' `
+  -Method Post -ContentType 'application/json' `
+  -Body '{"user_id":"test","query_text":"my name","top_k":5}'
+```

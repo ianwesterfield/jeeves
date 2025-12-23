@@ -64,6 +64,14 @@ jeeves/
 - **FastAPI app:** `main.py` on port 8005
 - **Router:** `api/executor.py` - tool, code, shell, file endpoints
 - **Services:** polyglot_handler.py (Python/PowerShell/Node), shell_handler.py, file_handler.py
+- **File Tools:**
+  - `read_file` - Read file contents
+  - `write_file` - Overwrite entire file
+  - `replace_in_file` - Surgical find/replace
+  - `insert_in_file` - Insert at position (start/end/before/after anchor)
+  - `append_to_file` - Add to end of file
+  - `list_files` - Directory listing
+  - `scan_workspace` - Recursive glob search
 
 ### Extractor Service (layers/extractor/)
 
@@ -75,10 +83,12 @@ jeeves/
 
 ### Jeeves Filter (filters/jeeves.filter.py)
 
-- **Intent classification:** Uses pragmatics_api or falls back to regex heuristics
-- **Orchestrator integration:** For task intents, engages orchestrator for multi-step planning
+- **Intent classification:** Uses pragmatics_api (4-class: casual/save/recall/task) or falls back to regex heuristics
+- **Pattern priority:** Edit patterns checked FIRST, then read patterns, then list patterns, then orchestrator
+- **Edit patterns:** `insert/add/append/put/write/include/create` + file reference → Executor API
 - **Memory operations:** Saves documents/images, searches for relevant context
 - **Context injection:** Prepends memories and analysis to user message
+- **Filter sync:** Edit `filters/jeeves.filter.py` directly, then sync via Open-WebUI API (not mounted volume)
 
 ### Memory Service
 
@@ -112,7 +122,10 @@ jeeves/
 - **Jeeves filter:** `GET /api/jeeves/filter` returns filter source for Open-WebUI
 - **Legacy endpoint:** `/api/memory/filter` redirects to Jeeves filter
 - **Network:** All services join `webtools_network` (external)
-- **Filter editing:** Edit `filters/jeeves.filter.py` directly - no rebuild needed (mounted volume)
+- **Filter sync:** Sync via Open-WebUI API after edits (filter stored in DB, not mounted volume):
+  ```powershell
+  python -c "import requests; f=open('filters/jeeves.filter.py',encoding='utf-8').read(); r=requests.post('http://localhost:8180/api/v1/functions/id/api/update', headers={'Authorization':'Bearer YOUR_API_KEY'}, json={'id':'api','name':'Jeeves','content':f,'meta':{'toggle':True}}, timeout=30); print(r.status_code)"
+  ```
 
 ## Guardrails for Agents
 
