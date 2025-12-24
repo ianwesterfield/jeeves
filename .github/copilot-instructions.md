@@ -27,7 +27,7 @@ docker ps -a
   - `executor_api` on port `8005` - polyglot code execution
   - `qdrant` vector DB on `6333` (HTTP) and `5100` (UI)
   - `ollama` on port `11434` - local LLM inference
-- **Data flow:** Open‑WebUI → `jeeves.filter.py` → classify intent → orchestrate if task → search/save memory → inject context
+- **Data flow:** Open‑WebUI → `jeeves.filter.py` → classify intent → stream orchestrator tasks (SSE) → search/save memory → inject context
 
 ## Where Things Live
 
@@ -57,7 +57,9 @@ jeeves/
 
 - **FastAPI app:** `main.py` on port 8004
 - **Model:** qwen2.5:14b via Ollama (env: `OLLAMA_MODEL`)
-- **Router:** `api/orchestrator.py` - set-workspace, next-step, execute-batch, update-state, reset-state
+- **Router:** `api/orchestrator.py` - set-workspace, next-step, run-task (SSE), update-state, reset-state
+- **Agentic Loop:** `/run-task` endpoint runs the full task loop with SSE streaming
+- **SSE Events:** status (UI updates), result (step outputs), error, complete (final context)
 - **Services:** reasoning_engine.py, code_planner.py, task_planner.py, parallel_executor.py, memory_connector.py, workspace_state.py
 - **Feedback Loop:** Filter passes step history back to orchestrator for multi-step reasoning
 - **Max Steps:** 15 iterations before forced completion
@@ -95,8 +97,8 @@ jeeves/
 ### Jeeves Filter (filters/jeeves.filter.py)
 
 - **Intent classification:** Uses pragmatics_api (4-class: casual/save/recall/task)
-- **Always delegate:** All task intents go to Orchestrator for reasoning (no shortcut patterns)
-- **Tool execution:** Orchestrator returns tool + params, filter executes via Executor API
+- **Always delegate:** All task intents go to Orchestrator via `/run-task` SSE endpoint
+- **SSE streaming:** Filter consumes SSE events from orchestrator, forwards status to UI
 - **Memory operations:** Saves documents/images, searches for relevant context
 - **Context injection:** Prepends memories and analysis to user message
 - **Status icons:** ✨ thinking, 🔍 scanning, 📖 reading, ✏️ editing, ⚙️ code, 💾 saving, 📚 memories, ✅ ready

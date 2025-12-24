@@ -5,19 +5,24 @@ Core endpoints for the agentic reasoning engine:
   - /set-workspace: Set active directory context for execution
   - /clone-workspace: Clone a git repo and set as workspace
   - /next-step: Generate single next step (may detect parallelization)
+  - /run-task: Execute full task with SSE streaming (agentic loop)
   - /execute-batch: Execute parallel batch; continue on individual failures
   - /update-state: Update workspace state after tool execution
   - /reset-state: Reset state for new task
 """
 
+import asyncio
+import json
 import logging
 import os
 import re
 import subprocess
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, AsyncGenerator
 
+import httpx
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 
 from schemas.models import (
     WorkspaceContext,
@@ -28,6 +33,8 @@ from schemas.models import (
     NextStepResponse,
     ExecuteBatchRequest,
     BatchResult,
+    RunTaskRequest,
+    TaskEvent,
 )
 from services.reasoning_engine import ReasoningEngine
 from services.task_planner import TaskPlanner
@@ -39,6 +46,9 @@ from utils.workspace_context import WorkspaceContextManager
 
 logger = logging.getLogger("orchestrator.api")
 router = APIRouter(tags=["orchestrator"])
+
+# Configuration
+EXECUTOR_API_URL = os.getenv("EXECUTOR_API_URL", "http://executor_api:8005")
 
 # Service instances (singleton pattern)
 _workspace_manager: Optional[WorkspaceContextManager] = None
@@ -431,3 +441,304 @@ async def set_user_info(request: SetUserInfoRequest) -> Dict[str, str]:
     logger.info(f"User info set: {state.user_info}")
     
     return state.user_info
+
+
+# ============================================================================
+# Streaming Task Execution (Agentic Loop)
+# ============================================================================
+
+async def _execute_tool(workspace_root: str, tool: str, params: dict) -> dict:
+    """Execute a tool via the executor API."""
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        try:
+            # Resolve relative paths in params
+            resolved_params = params.copy()
+            if "path" in resolved_params:
+                path = resolved_params["path"]
+                project_name = workspace_root.rstrip("/").split("/")[-1].lower()
+                
+                if path == "." or path == "" or path.lower() == project_name:
+                    resolved_params["path"] = workspace_root
+                elif not path.startswith("/"):
+                    resolved_params["path"] = f"{workspace_root}/{path}"
+            
+            resp = await client.post(
+                f"{EXECUTOR_API_URL}/api/execute/tool",
+                json={
+                    "tool": tool,
+                    "params": resolved_params,
+                    "workspace_context": {
+                        "workspace_root": "/workspace",
+                        "cwd": workspace_root,
+                        "allow_file_write": True,
+                        "allow_shell_commands": True,
+                        "allowed_languages": ["python"],
+                    },
+                },
+            )
+            
+            if resp.status_code == 200:
+                return resp.json()
+            else:
+                return {"success": False, "output": None, "error": f"HTTP {resp.status_code}"}
+                
+        except Exception as e:
+            return {"success": False, "output": None, "error": str(e)}
+
+
+def _format_result_block(tool: str, params: dict, output: str, reasoning: str) -> str:
+    """Format tool result as context block for LLM."""
+    if tool == "scan_workspace":
+        return f"""### Workspace Files ###
+⚠️ THIS IS THE COMPLETE FILE LIST. Do not invent files not shown below.
+
+```
+{output or "(no files found)"}
+```
+
+### End Workspace Files ###
+"""
+    
+    elif tool == "read_file":
+        path = params.get("path", "file")
+        return f"""### File Content: {path} ###
+**ACTUAL CONTENT (do not invent or paraphrase):**
+
+```
+{output or "(empty)"}
+```
+⚠️ The above is the COMPLETE file content. Do not add anything not shown above.
+### End File Content ###
+"""
+    
+    elif tool in ("write_file", "append_to_file", "replace_in_file", "insert_in_file"):
+        path = params.get("path", "file")
+        content = params.get("content") or params.get("text") or params.get("new_text") or ""
+        content_snippet = content[:200] + "..." if len(content) > 200 else content
+        return f"""### File Operation Result ###
+**Operation:** {tool} on {path}
+**Status:** ✅ Success
+**EXACT content written:** `{content_snippet}`
+⚠️ Report ONLY this exact content. Do not embellish or reformat.
+### End File Operation ###
+"""
+    
+    elif tool == "execute_shell":
+        cmd = params.get("command", "")
+        return f"""### Shell Command Result ###
+**Command:** `{cmd}`
+**Status:** ✅ Success
+**Output:** {output or "(no output)"}
+### End Shell Command ###
+"""
+    
+    else:
+        return f"""### {tool} Result ###
+**Reasoning:** {reasoning}
+
+```
+{output or "(no output)"}
+```
+### End Result ###
+"""
+
+
+async def _run_task_generator(request: RunTaskRequest) -> AsyncGenerator[str, None]:
+    """
+    Generator that yields SSE events during task execution.
+    
+    This is the agentic loop moved from the filter to the orchestrator.
+    """
+    reasoning_engine = _get_reasoning_engine()
+    workspace_state = get_workspace_state()
+    
+    # Reset state for new task
+    reset_workspace_state()
+    workspace_state = get_workspace_state()
+    
+    # Build task with memory context
+    user_text = request.task
+    if request.memory_context:
+        user_info = []
+        for item in request.memory_context[:3]:
+            facts = item.get('facts')
+            if facts and isinstance(facts, dict):
+                for fact_type, fact_value in facts.items():
+                    user_info.append(f"{fact_type}: {fact_value}")
+            else:
+                text = item.get('user_text', '')
+                if text:
+                    user_info.append(text)
+        
+        if user_info:
+            info_block = "\n".join(f"- {info}" for info in user_info)
+            user_text = f"User information from memory:\n{info_block}\n\nTask: {user_text}"
+    
+    # Set workspace
+    try:
+        manager = _get_workspace_manager()
+        await manager.set_workspace(cwd=request.workspace_root, user_id=request.user_id)
+    except Exception as e:
+        yield f"data: {json.dumps({'event_type': 'error', 'status': f'Failed to set workspace: {e}', 'done': True})}\n\n"
+        return
+    
+    # Emit initial status
+    yield f"data: {json.dumps({'event_type': 'status', 'status': '✨ Thinking...', 'done': False})}\n\n"
+    
+    step_history = []
+    all_results = []
+    edit_tools = ("write_file", "replace_in_file", "insert_in_file", "append_to_file")
+    
+    for step_num in range(1, request.max_steps + 1):
+        try:
+            # Get next step from reasoning engine
+            step = await reasoning_engine.generate_next_step(
+                task=user_text,
+                history=[],  # History is now in workspace_state
+                memory_context=[],
+                workspace_context=None,
+                workspace_state=workspace_state,
+            )
+            
+            tool = step.tool
+            params = step.params
+            reasoning = step.reasoning or ""
+            
+            # Handle completion
+            if tool == "complete":
+                if params.get("error"):
+                    all_results.append(f"""### Orchestrator Error ###
+{params.get('error')}
+### End Error ###
+""")
+                break
+            
+            # Build status message
+            tool_path = params.get("path", "")
+            short_path = tool_path.split("/")[-1].split("\\")[-1] if tool_path else ""
+            reasoning_snippet = reasoning[:40] + "..." if len(reasoning) > 40 else reasoning
+            
+            status_map = {
+                "scan_workspace": f"✨ {reasoning_snippet}, scanning 🔍 {short_path or 'the workspace'}",
+                "read_file": f"✨ {reasoning_snippet}, reading 📖 {short_path}",
+                "execute_shell": f"✨ {reasoning_snippet}, running 🖥️ {params.get('command', '')[:30]}...",
+            }
+            
+            if tool in edit_tools:
+                edit_count = sum(1 for h in step_history if h["tool"] in edit_tools and h.get("success"))
+                if edit_count == 0:
+                    status = f"✨ {reasoning_snippet}, editing ✏️ {short_path}"
+                else:
+                    status = None  # Silent for batch edits
+            else:
+                status = status_map.get(tool, f"✨ {reasoning_snippet}")
+            
+            if status:
+                yield f"data: {json.dumps({'event_type': 'status', 'step_num': step_num, 'tool': tool, 'status': status, 'done': False})}\n\n"
+            
+            # Execute tool
+            result = await _execute_tool(request.workspace_root, tool, params)
+            success = result.get("success", False)
+            output = result.get("output")
+            error = result.get("error")
+            
+            # Update workspace state
+            workspace_state.update_from_step(
+                tool=tool,
+                params={k: v for k, v in params.items() if k not in ("content", "text", "new_text")},
+                output=output[:50000] if output else "",
+                success=success,
+            )
+            
+            # Record step
+            step_history.append({
+                "step_id": f"step_{step_num}",
+                "tool": tool,
+                "params": {k: v for k, v in params.items() if k != "content"},
+                "success": success,
+                "output": output[:10000] if output else None,
+                "error": error,
+            })
+            
+            # Format result for context
+            if success:
+                result_block = _format_result_block(tool, params, output, reasoning)
+                all_results.append(result_block)
+                
+                # Yield result event
+                yield f"data: {json.dumps({'event_type': 'result', 'step_num': step_num, 'tool': tool, 'result': {'success': True, 'output_preview': (output[:500] if output else None)}, 'done': False})}\n\n"
+            else:
+                error_snippet = (error[:40] + "...") if error and len(error) > 40 else (error or "unknown")
+                yield f"data: {json.dumps({'event_type': 'status', 'step_num': step_num, 'tool': tool, 'status': f'⚠️ Failed: {error_snippet}', 'done': False})}\n\n"
+                
+                all_results.append(f"""### Step {step_num} Error ###
+**Tool:** {tool}
+**Reasoning:** {reasoning}
+**Error:** {error or "Unknown error"}
+### End Error ###
+""")
+            
+            # Small delay to prevent overwhelming the client
+            await asyncio.sleep(0.01)
+            
+        except Exception as e:
+            logger.error(f"Step {step_num} error: {e}")
+            yield f"data: {json.dumps({'event_type': 'error', 'step_num': step_num, 'status': f'Error: {str(e)[:50]}', 'done': False})}\n\n"
+    
+    # Build final context
+    if all_results:
+        file_ops = sum(1 for r in all_results if "File Operation Result" in r)
+        
+        header = """### TASK ALREADY COMPLETED ###
+**CRITICAL:** The actions below have ALREADY been executed. Do NOT hallucinate details.
+- Speak in PAST TENSE: "I added...", "I updated..."
+- Report EXACTLY what the logs show - do NOT invent content or formats
+- The "Content added" field shows the EXACT text that was written
+"""
+        if file_ops > 0:
+            header += f"**Files modified:** {file_ops}\n"
+        header += "### Action Log ###\n"
+        
+        footer = """### End Action Log ###
+
+⚠️ FINAL INSTRUCTION: Summarize ONLY what is shown in the logs above.
+- Do NOT invent file names, paths, or content
+- Do NOT add files that aren't listed
+- Do NOT make up file contents
+- If you don't see data above, say "I couldn't complete that"
+"""
+        final_context = header + "\n".join(all_results) + footer
+    else:
+        final_context = None
+    
+    # Emit completion with final context
+    yield f"data: {json.dumps({'event_type': 'complete', 'status': '✅ Ready', 'result': {'context': final_context, 'steps_executed': len(step_history)}, 'done': True})}\n\n"
+
+
+@router.post("/run-task")
+async def run_task(request: RunTaskRequest):
+    """
+    Execute a complete task with Server-Sent Events (SSE) streaming.
+    
+    This moves the entire agentic loop from the filter to the orchestrator.
+    The filter can now simply:
+      1. POST /run-task
+      2. Stream SSE events
+      3. Forward status events to __event_emitter__
+      4. Inject final context into conversation
+    
+    Event types:
+      - status: UI status update (step_num, tool, status, done)
+      - result: Step result (step_num, tool, result, done)
+      - error: Error occurred (status, done)
+      - complete: Task finished (result.context, result.steps_executed, done)
+    """
+    return StreamingResponse(
+        _run_task_generator(request),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        },
+    )

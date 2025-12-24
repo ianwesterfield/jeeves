@@ -151,6 +151,29 @@ class NextStepResponse(BaseModel):
     is_batch: bool = Field(default=False, description="Whether this is a batch of steps")
 
 
+# ============================================================================
+# Streaming Task Execution
+# ============================================================================
+
+class RunTaskRequest(BaseModel):
+    """Request to run a complete task with streaming updates."""
+    task: str = Field(..., description="User's task description")
+    workspace_root: str = Field(..., description="Workspace root path")
+    user_id: Optional[str] = Field(None, description="User ID")
+    memory_context: Optional[List[Dict[str, Any]]] = Field(None, description="User context from memory")
+    max_steps: int = Field(default=100, description="Maximum steps before forced completion")
+
+
+class TaskEvent(BaseModel):
+    """Server-sent event during task execution."""
+    event_type: str = Field(..., description="Event type: status, result, complete, error")
+    step_num: int = Field(default=0, description="Current step number")
+    tool: Optional[str] = Field(None, description="Tool being executed")
+    status: str = Field(default="", description="Status message for UI")
+    result: Optional[Dict[str, Any]] = Field(None, description="Step result data")
+    done: bool = Field(default=False, description="Whether task is complete")
+
+
 class ExecuteBatchRequest(BaseModel):
     """Request to execute a batch of steps in parallel."""
     steps: List[Step] = Field(..., description="Steps to execute")

@@ -176,354 +176,8 @@ def _detect_task_continuation(user_text: str, messages: List[dict], confidence: 
 
 
 # ============================================================================
-# Workspace Operations (Direct Execution)
-# ============================================================================
-
-def _list_workspace_files(workspace_root: str, recursive: bool = True, max_depth: int = 3) -> Optional[str]:
-    """
-    List files in workspace via executor API.
-    
-    Args:
-        workspace_root: Path to list
-        recursive: If True, list subdirectories too
-        max_depth: Max depth for recursive listing
-    
-    Returns formatted file listing or None on error.
-    """
-    try:
-        if recursive:
-            # Use scan_workspace tool for recursive listing
-            resp = requests.post(
-                f"{EXECUTOR_API_URL}/api/execute/tool",
-                json={
-                    "tool": "scan_workspace",
-                    "params": {
-                        "path": workspace_root,
-                        "pattern": "*",
-                    },
-                    "workspace_context": {
-                        "workspace_root": "/workspace",
-                        "cwd": "/workspace",
-                        "allow_file_write": False,
-                    },
-                },
-                timeout=30,
-            )
-            
-            if resp.status_code == 200:
-                result = resp.json()
-                if result.get("success") and result.get("output"):
-                    import json as json_module
-                    try:
-                        data = json_module.loads(result["output"])
-                        files = data.get("files", [])
-                        dirs = data.get("dirs", [])
-                        
-                        # Filter by depth and exclude .git internals
-                        def filter_by_depth(paths, max_d):
-                            filtered = []
-                            for p in paths:
-                                # Skip .git internals (but keep .git itself)
-                                if ".git/" in p or ".git\\" in p:
-                                    continue
-                                # Check depth
-                                depth = p.count("/") + p.count("\\")
-                                if depth <= max_d:
-                                    filtered.append(p)
-                            return sorted(filtered)
-                        
-                        files = filter_by_depth(files, max_depth)
-                        dirs = filter_by_depth(dirs, max_depth)
-                        
-                        # Build tree-like output
-                        lines = []
-                        all_items = [(d, "dir") for d in dirs] + [(f, "file") for f in files]
-                        all_items.sort(key=lambda x: x[0])
-                        
-                        for path, item_type in all_items[:500]:  # DEV MODE: Show more files
-                            prefix = "📁 " if item_type == "dir" else "📄 "
-                            # Add indentation based on depth
-                            depth = path.count("/") + path.count("\\")
-                            indent = "  " * depth
-                            name = path.split("/")[-1].split("\\")[-1]
-                            lines.append(f"{indent}{prefix}{path}")
-                        
-                        if data.get("truncated"):
-                            lines.append("... (truncated)")
-                        
-                        return "\n".join(lines) if lines else "No files found"
-                    except:
-                        pass
-        
-        # Fallback: simple flat listing
-        resp = requests.post(
-            f"{EXECUTOR_API_URL}/api/execute/file",
-            json={
-                "operation": "list",
-                "path": workspace_root,
-            },
-            timeout=15,
-        )
-        
-        if resp.status_code == 200:
-            result = resp.json()
-            if result.get("success"):
-                items = result.get("data", [])
-                if items:
-                    lines = []
-                    for item in items[:500]:  # DEV MODE: Show more files
-                        prefix = "📁 " if item.get("type") == "dir" else "📄 "
-                        lines.append(f"{prefix}{item.get('name', '?')}")
-                    return "\n".join(lines)
-            
-    except Exception as e:
-        print(f"[jeeves] File listing error: {e}")
-    
-    return None
-
-
-def _read_workspace_file(workspace_root: str, filepath: str, max_lines: int = 500) -> Optional[str]:  # DEV MODE
-    """
-    Read a file from the workspace.
-    
-    Returns file content or None on error.
-    """
-    try:
-        resp = requests.post(
-            f"{EXECUTOR_API_URL}/api/execute/file",
-            json={
-                "operation": "read",
-                "path": filepath,
-            },
-            timeout=10,
-        )
-        
-        if resp.status_code == 200:
-            result = resp.json()
-            if result.get("success"):
-                content = result.get("data", "")
-                # Truncate if too long
-                lines = content.split("\n")
-                if len(lines) > max_lines:
-                    return "\n".join(lines[:max_lines]) + f"\n... ({len(lines) - max_lines} more lines)"
-                return content
-            
-    except Exception as e:
-        print(f"[jeeves] File read error: {e}")
-    
-    return None
-
-
-def _write_workspace_file(workspace_root: str, filepath: str, content: str) -> Tuple[bool, str]:
-    """
-    Write content to a file in the workspace (full replacement).
-    
-    Returns (success, message).
-    """
-    try:
-        resp = requests.post(
-            f"{EXECUTOR_API_URL}/api/execute/tool",
-            json={
-                "tool": "write_file",
-                "params": {
-                    "path": filepath,
-                    "content": content,
-                },
-                "workspace_context": {
-                    "workspace_root": workspace_root,
-                    "cwd": workspace_root,
-                    "allow_file_write": True,
-                    "allow_shell_commands": False,
-                    "allowed_languages": [],
-                },
-            },
-            timeout=15,
-        )
-        
-        if resp.status_code == 200:
-            result = resp.json()
-            if result.get("success"):
-                return True, result.get("output", "File written successfully")
-            else:
-                return False, result.get("error", "Write failed")
-                
-    except Exception as e:
-        print(f"[jeeves] File write error: {e}")
-        return False, str(e)
-    
-    return False, "Unknown error"
-
-
-def _replace_in_workspace_file(
-    workspace_root: str, 
-    filepath: str, 
-    old_text: str, 
-    new_text: str
-) -> Tuple[bool, str]:
-    """
-    Surgical replace: find old_text and replace with new_text.
-    
-    Returns (success, message).
-    """
-    try:
-        resp = requests.post(
-            f"{EXECUTOR_API_URL}/api/execute/tool",
-            json={
-                "tool": "replace_in_file",
-                "params": {
-                    "path": filepath,
-                    "old_text": old_text,
-                    "new_text": new_text,
-                },
-                "workspace_context": {
-                    "workspace_root": workspace_root,
-                    "cwd": workspace_root,
-                    "allow_file_write": True,
-                    "allow_shell_commands": False,
-                    "allowed_languages": [],
-                },
-            },
-            timeout=15,
-        )
-        
-        if resp.status_code == 200:
-            result = resp.json()
-            if result.get("success"):
-                return True, result.get("output", "Replacement successful")
-            else:
-                return False, result.get("error", "Replace failed")
-                
-    except Exception as e:
-        print(f"[jeeves] File replace error: {e}")
-        return False, str(e)
-    
-    return False, "Unknown error"
-
-
-def _insert_in_workspace_file(
-    workspace_root: str,
-    filepath: str,
-    position: str,
-    text: str,
-    anchor: Optional[str] = None,
-) -> Tuple[bool, str]:
-    """
-    Insert text at position in file.
-    
-    position: "start", "end", "before", "after"
-    anchor: Required for "before"/"after" - the text to search for
-    
-    Returns (success, message).
-    """
-    try:
-        params = {
-            "path": filepath,
-            "position": position,
-            "text": text,
-        }
-        if anchor:
-            params["anchor"] = anchor
-            
-        resp = requests.post(
-            f"{EXECUTOR_API_URL}/api/execute/tool",
-            json={
-                "tool": "insert_in_file",
-                "params": params,
-                "workspace_context": {
-                    "workspace_root": workspace_root,
-                    "cwd": workspace_root,
-                    "allow_file_write": True,
-                    "allow_shell_commands": False,
-                    "allowed_languages": [],
-                },
-            },
-            timeout=15,
-        )
-        
-        if resp.status_code == 200:
-            result = resp.json()
-            if result.get("success"):
-                return True, result.get("output", "Insert successful")
-            else:
-                return False, result.get("error", "Insert failed")
-                
-    except Exception as e:
-        print(f"[jeeves] File insert error: {e}")
-        return False, str(e)
-    
-    return False, "Unknown error"
-
-
-def _append_to_workspace_file(workspace_root: str, filepath: str, content: str) -> Tuple[bool, str]:
-    """
-    Append content to end of file.
-    
-    Returns (success, message).
-    """
-    return _insert_in_workspace_file(workspace_root, filepath, "end", content)
-
-
-# ============================================================================
 # Orchestrator Integration
 # ============================================================================
-
-def _execute_tool(workspace_root: str, tool: str, params: dict) -> dict:
-    """
-    Execute a tool via the executor API.
-    
-    Args:
-        workspace_root: Container path like /workspace/jeeves
-        tool: Tool name
-        params: Tool parameters (paths will be resolved relative to workspace_root)
-    
-    Returns dict with success, output, error.
-    """
-    try:
-        # Resolve relative paths in params
-        resolved_params = params.copy()
-        if "path" in resolved_params:
-            path = resolved_params["path"]
-            
-            # Extract project name from workspace_root (e.g., "jeeves" from "/workspace/jeeves")
-            project_name = workspace_root.rstrip("/").split("/")[-1].lower()
-            
-            # Handle relative paths
-            if path == "." or path == "" or path.lower() == project_name:
-                # ".", "", or project name itself → workspace root
-                resolved_params["path"] = workspace_root
-            elif not path.startswith("/"):
-                # Other relative paths → resolve relative to workspace
-                resolved_params["path"] = f"{workspace_root}/{path}"
-        
-        resp = requests.post(
-            f"{EXECUTOR_API_URL}/api/execute/tool",
-            json={
-                "tool": tool,
-                "params": resolved_params,
-                "workspace_context": {
-                    "workspace_root": "/workspace",  # Container mount point
-                    "cwd": workspace_root,
-                    "allow_file_write": True,
-                    "allow_shell_commands": True,  # Enable for git operations
-                    "allowed_languages": ["python"],
-                },
-            },
-            timeout=60,
-        )
-        
-        if resp.status_code == 200:
-            return resp.json()
-        else:
-            return {"success": False, "output": None, "error": f"HTTP {resp.status_code}"}
-            
-    except Exception as e:
-        return {"success": False, "output": None, "error": str(e)}
-
-
-# Maximum steps to prevent infinite loops
-# DEV MODE: Set high to allow complex multi-step tasks
-MAX_ORCHESTRATOR_STEPS = 100
-
 
 def _build_task_description(messages: List[dict]) -> str:
     """
@@ -590,359 +244,82 @@ async def _orchestrate_task(
     memory_context: Optional[List[dict]] = None,
 ) -> Optional[str]:
     """
-    Handle task intents via orchestrator reasoning + executor.
+    Handle task intents via orchestrator streaming endpoint.
     
     Flow:
-      1. Send task to orchestrator for reasoning
-      2. Orchestrator returns next step (tool + params)
-      3. Execute step via executor
-      4. Feed results back to orchestrator
-      5. Repeat until tool="complete" or max steps reached
+      1. POST /run-task to orchestrator (starts SSE stream)
+      2. Forward status events to __event_emitter__
+      3. Return final context when complete
     
-    Args:
-        memory_context: User context from memory (name, preferences, etc.)
-    
-    Returns context string to inject into conversation.
+    The agentic loop now runs in the orchestrator, not here.
     """
-    # Build complete task description (handles continuations)
-    user_text = _build_task_description(messages)
-    
-    # Pass memory context to orchestrator - prefer structured facts when available
-    if memory_context:
-        user_info = []
-        for item in memory_context[:3]:
-            # Check for extracted facts first (structured data)
-            facts = item.get('facts')
-            if facts and isinstance(facts, dict):
-                for fact_type, fact_value in facts.items():
-                    # Format as clear key: value for LLM
-                    user_info.append(f"{fact_type}: {fact_value}")
-            else:
-                # Fall back to raw text
-                text = item.get('user_text', '')
-                if text:
-                    user_info.append(text)
-        
-        if user_info:
-            # Prepend user info to task for LLM to reference
-            info_block = "\n".join(f"- {info}" for info in user_info)
-            user_text = f"User information from memory:\n{info_block}\n\nTask: {user_text}"
-    
     if not workspace_root:
         return None
     
-    # Track step history for feedback loop
-    step_history: List[dict] = []
-    all_results: List[str] = []
+    # Build complete task description (handles continuations)
+    user_text = _build_task_description(messages)
     
     try:
-        # Reset state at start of new task
         await __event_emitter__({
             "type": "status",
             "data": {"description": "✨ Thinking...", "done": False, "hidden": False}
         })
         
-        # Reset orchestrator state for new task
-        try:
-            requests.post(
-                f"{ORCHESTRATOR_API_URL}/api/orchestrate/reset-state",
-                timeout=5,
-            )
-        except Exception as e:
-            print(f"[jeeves] Failed to reset state: {e}")
+        # Stream task execution from orchestrator
+        import httpx
         
-        # Extract user info from task using spaCy NER (via pragmatics service)
-        try:
-            ner_resp = requests.post(
-                f"{PRAGMATICS_API_URL}/api/pragmatics/user-info",
-                json={"text": user_text},
-                timeout=10,
-            )
-            if ner_resp.status_code == 200:
-                user_info = ner_resp.json()
-                # Set any extracted info in orchestrator state
-                info_to_set = {}
-                if user_info.get("name"):
-                    info_to_set["name"] = user_info["name"]
-                if user_info.get("email"):
-                    info_to_set["email"] = user_info["email"]
-                
-                if info_to_set:
-                    requests.post(
-                        f"{ORCHESTRATOR_API_URL}/api/orchestrate/set-user-info",
-                        json=info_to_set,
-                        timeout=5,
-                    )
-                    print(f"[jeeves] Set user info via NER: {info_to_set}")
-        except Exception as e:
-            print(f"[jeeves] NER extraction failed: {e}")
-        
-        requests.post(
-            f"{ORCHESTRATOR_API_URL}/api/orchestrate/set-workspace",
-            json={"cwd": workspace_root, "user_id": user_id},
-            timeout=10,
-        )
-        
-        # Multi-step execution loop
-        for step_num in range(1, MAX_ORCHESTRATOR_STEPS + 1):
-            # Get next step from orchestrator (with history feedback)
-            resp = requests.post(
-                f"{ORCHESTRATOR_API_URL}/api/orchestrate/next-step",
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
+            async with client.stream(
+                "POST",
+                f"{ORCHESTRATOR_API_URL}/api/orchestrate/run-task",
                 json={
                     "task": user_text,
+                    "workspace_root": workspace_root,
                     "user_id": user_id,
-                    "history": step_history,  # Feedback: previous step results
-                    "conversation_history": messages[-10:],
+                    "memory_context": memory_context,
+                    "max_steps": 100,
                 },
-                timeout=300,  # DEV MODE: Extended LLM reasoning time
-            )
-            
-            if resp.status_code != 200:
-                print(f"[jeeves] Orchestrator returned {resp.status_code}")
-                break
-            
-            step = resp.json()
-            tool = step.get("tool", "complete")
-            params = step.get("params", {})
-            reasoning = step.get("reasoning", "")
-            
-            # Handle completion - no summary needed, just break
-            if tool == "complete":
-                if params.get("error"):
-                    all_results.append(f"""### Orchestrator Error ###
-{params.get('error')}
-### End Error ###
-""")
-                # Break out of loop - task complete
-                break
-            
-            # Count edits for progress display (before executing)
-            edit_tools = ("write_file", "replace_in_file", "insert_in_file", "append_to_file")
-            edit_count = sum(1 for h in step_history if h["tool"] in edit_tools and h["status"] == "success")
-            
-            # Track logical steps (not individual file operations)
-            # A logical step is: scan, read, code execution, or an edit BATCH (not each file)
-            is_first_edit_in_batch = tool in edit_tools and edit_count == 0
-            is_continuation_edit = tool in edit_tools and edit_count > 0
-            
-            # Extract total from reasoning if available (e.g., "Editing file 1/64")
-            import re
-            total_match = re.search(r'/(\d+)', reasoning)
-            total_files = int(total_match.group(1)) if total_match else None
-            
-            # Build short path for display
-            tool_path = params.get("path", "")
-            short_path = tool_path.split("/")[-1].split("\\")[-1] if tool_path else ""
-            
-            # Natural conversational status: ✨ {reason}, I'm {verb}ing 🔍 {target}
-            # Truncate reasoning for status display (first ~40 chars)
-            reasoning_snippet = reasoning[:40] + "..." if len(reasoning) > 40 else reasoning
-            
-            if tool == "scan_workspace":
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {"description": f"✨ {reasoning_snippet}, scanning 🔍 {short_path or 'the workspace'}", "done": False, "hidden": False}
-                })
-            elif tool == "read_file":
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {"description": f"✨ {reasoning_snippet}, reading 📖 {short_path}", "done": False, "hidden": False}
-                })
-            elif tool in edit_tools:
-                # BATCH MODE: Only show status on first edit, not every file
-                if is_first_edit_in_batch:
-                    if total_files:
+            ) as response:
+                final_context = None
+                
+                async for line in response.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    
+                    try:
+                        event = json.loads(line[6:])  # Strip "data: " prefix
+                    except json.JSONDecodeError:
+                        continue
+                    
+                    event_type = event.get("event_type", "")
+                    status = event.get("status", "")
+                    done = event.get("done", False)
+                    
+                    # Forward status events to UI
+                    if event_type == "status" and status:
                         await __event_emitter__({
                             "type": "status",
-                            "data": {"description": f"✨ Editing ✏️ {total_files} files...", "done": False, "hidden": False}
+                            "data": {"description": status, "done": done, "hidden": False}
                         })
-                    else:
+                    
+                    elif event_type == "error":
                         await __event_emitter__({
                             "type": "status",
-                            "data": {"description": f"✨ {reasoning_snippet}, editing ✏️ {short_path}", "done": False, "hidden": False}
+                            "data": {"description": f"❌ {status}", "done": done, "hidden": False}
                         })
-                # Silent for subsequent edits in batch
-            elif tool == "execute_code":
-                lang = params.get("language", "code")
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {"description": f"✨ {reasoning_snippet}, running ⚙️ {lang}", "done": False, "hidden": False}
-                })
-            elif tool == "execute_shell":
-                cmd = params.get("command", "")[:30]
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {"description": f"✨ {reasoning_snippet}, running 🖥️ {cmd}...", "done": False, "hidden": False}
-                })
-            else:
-                # Other tools - show reasoning
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {"description": f"✨ {reasoning_snippet}", "done": False, "hidden": False}
-                })
-            
-            result = _execute_tool(workspace_root, tool, params)
-            
-            success = result.get("success", False)
-            output = result.get("output")
-            error = result.get("error")
-            
-            # Update orchestrator state with tool result
-            try:
-                requests.post(
-                    f"{ORCHESTRATOR_API_URL}/api/orchestrate/update-state",
-                    json={
-                        "tool": tool,
-                        "params": {k: v for k, v in params.items() if k not in ("content", "text", "new_text")},
-                        "output": output[:50000] if output else "",  # Limit size but include full scan output
-                        "success": success,
-                    },
-                    timeout=5,
-                )
-            except Exception as e:
-                print(f"[jeeves] Failed to update state: {e}")
-            
-            # Only show errors - success is silent
-            if not success:
-                error_snippet = (error[:40] + "...") if error and len(error) > 40 else (error or "unknown")
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {"description": f"⚠️ Failed: {error_snippet}", "done": False, "hidden": False}
-                })
-            
-            # Record step result for feedback to orchestrator
-            # Include tool name so orchestrator knows what was already done
-            step_result = {
-                "step_id": f"step_{step_num}",
-                "tool": tool,
-                "params": {k: v for k, v in params.items() if k != "content"},  # Exclude large content
-                "status": "success" if success else "failed",
-                "output": (output[:10000] if output else None),  # DEV MODE: Large context
-                "error": error,
-            }
-            step_history.append(step_result)
-            
-            # Format result for context injection
-            if success:
-                # Format output based on tool type
-                if tool == "scan_workspace":
-                    formatted = output if output else "(no files found)"
-                    all_results.append(f"""### Workspace Files ###
-⚠️ THIS IS THE COMPLETE FILE LIST. Do not invent files not shown below.
-
-```
-{formatted}
-```
-
-### End Workspace Files ###
-""")
+                    
+                    elif event_type == "complete":
+                        result = event.get("result", {})
+                        final_context = result.get("context")
+                        await __event_emitter__({
+                            "type": "status",
+                            "data": {"description": "✅ Ready", "done": True, "hidden": False}
+                        })
                 
-                elif tool == "read_file":
-                    path = params.get("path", "file")
-                    all_results.append(f"""### File Content: {path} ###
-**ACTUAL CONTENT (do not invent or paraphrase):**
-
-```
-{output or "(empty)"}
-```
-⚠️ The above is the COMPLETE file content. Do not add anything not shown above.
-### End File Content ###
-""")
+                return final_context
                 
-                elif tool in ("write_file", "append_to_file", "replace_in_file", "insert_in_file"):
-                    path = params.get("path", "file")
-                    # Include snippet of actual content for accurate summarization
-                    # Different tools use different param names for content
-                    content = params.get("content") or params.get("text") or params.get("new_text") or ""
-                    content_snippet = content[:200] + "..." if len(content) > 200 else content
-                    all_results.append(f"""### File Operation Result ###
-**Operation:** {tool} on {path}
-**Status:** ✅ Success
-**EXACT content written:** `{content_snippet}`
-⚠️ Report ONLY this exact content. Do not embellish or reformat.
-### End File Operation ###
-""")
-                
-                elif tool == "execute_code":
-                    lang = params.get("language", "code")
-                    all_results.append(f"""### Code Execution Result ###
-**Language:** {lang}
-**Reasoning:** {reasoning}
-
-```
-{output or "(no output)"}
-```
-### End Code Execution ###
-""")
-                
-                elif tool == "execute_shell":
-                    cmd = params.get("command", "")
-                    all_results.append(f"""### Shell Command Result ###
-**Command:** `{cmd}`
-**Status:** ✅ Success
-**Output:** {output or "(no output)"}
-### End Shell Command ###
-""")
-                
-                else:
-                    all_results.append(f"""### {tool} Result ###
-**Reasoning:** {reasoning}
-
-```
-{output or "(no output)"}
-```
-### End Result ###
-""")
-            
-            else:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {"description": f"⚠️ Step {step_num} failed, adjusting...", "done": False, "hidden": False}
-                })
-                
-                all_results.append(f"""### Step {step_num} Error ###
-**Tool:** {tool}
-**Reasoning:** {reasoning}
-**Error:** {error or "Unknown error"}
-### End Error ###
-""")
-                
-                # Don't break on error - let orchestrator decide how to recover
-        
-        # Final status already shown at completion - just mark done
-        await __event_emitter__({
-            "type": "status",
-            "data": {"description": "✅ Ready", "done": True, "hidden": False}
-        })
-        
-        # Return all accumulated results with clear COMPLETED header
-        if all_results:
-            # Count successful operations for summary
-            file_ops = sum(1 for r in all_results if "File Operation Result" in r)
-            
-            header = """### TASK ALREADY COMPLETED ###
-**CRITICAL:** The actions below have ALREADY been executed. Do NOT hallucinate details.
-- Speak in PAST TENSE: "I added...", "I updated..."
-- Report EXACTLY what the logs show - do NOT invent content or formats
-- The "Content added" field shows the EXACT text that was written
-"""
-            if file_ops > 0:
-                header += f"**Files modified:** {file_ops}\n"
-            header += "### Action Log ###\n"
-            
-            footer = """### End Action Log ###
-
-⚠️ FINAL INSTRUCTION: Summarize ONLY what is shown in the logs above.
-- Do NOT invent file names, paths, or content
-- Do NOT add files that aren't listed
-- Do NOT make up file contents
-- If you don't see data above, say "I couldn't complete that"
-"""
-            return header + "\n".join(all_results) + footer
-        return None
-        
     except Exception as e:
-        print(f"[jeeves] Orchestrator error: {e}")
+        print(f"[jeeves] Orchestrator streaming error: {e}")
         await __event_emitter__({
             "type": "status",
             "data": {"description": f"❌ Error: {str(e)[:30]}", "done": True, "hidden": False}
