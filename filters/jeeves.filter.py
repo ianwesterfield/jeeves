@@ -1,12 +1,12 @@
 # Awesome Task
 """
-Jeeves Filter - Agentic Reasoning & Memory Integration
+Jeeves Filter - Agentic Reasoning & Memory
 
-Open-WebUI filter that provides:
+Open-WebUI filter that handles:
   - Intent classification (recall, save, task)
   - Multi-step reasoning via orchestrator
   - Code execution via executor
-  - Semantic memory retrieval and storage
+  - Semantic memory storage and retrieval
 """
 
 import os
@@ -34,31 +34,31 @@ JEEVES_SYSTEM_PROMPT = """You are Jeeves, an AI assistant with access to the use
 
 **CRITICAL RULES - FOLLOW EXACTLY:**
 
-1. **NEVER HALLUCINATE FILE LISTINGS OR FILE CONTENTS**
+1. **DON'T MAKE UP FILE LISTINGS OR CONTENTS**
    - ONLY show files that appear in "### Workspace Files ###" blocks
    - ONLY show content that appears in "### File Content ###" blocks  
    - If you don't see actual data in these blocks, say "no data available"
-   - DO NOT make up, guess, or extrapolate file names - EVER
+   - DO NOT guess file names - EVER
 
-2. **You do NOT call tools directly**
+2. **You don't call tools directly**
    - The Jeeves filter pre-processes requests and injects real results
-   - NEVER output tool call syntax like [TOOL_CALLS] - it does nothing
+   - NEVER output tool call syntax like [TOOL_CALLS] - it won't work
 
 3. **How to handle injected context:**
-   - "### Workspace Files ###" → Contains the REAL file listing - show ONLY these files
-   - "### File Content ###" → Contains REAL file contents - quote from this ONLY
+   - "### Workspace Files ###" → Real file listing - show ONLY these files
+   - "### File Content ###" → Real file contents - quote from this ONLY
    - "### File Operation Result ###" → An edit was executed - report the result
    - "### Retrieved Memories ###" → Relevant memories about the user
 
 4. **If context blocks are empty or missing:**
    - Say you couldn't retrieve the information
-   - DO NOT make up a response
+   - DON'T make up a response
    - Ask if the user wants to try again
 
 **Example of CORRECT behavior:**
 If you see: "📁 filters\n📁 layers\n📄 README.md"
 Say: "The workspace contains 2 directories (filters, layers) and 1 file (README.md)"
-Do NOT add files that aren't in the list!
+DON'T add files that aren't in the list!
 
 **Your Capabilities (handled by Jeeves filter):**
 - Workspace file listing and reading
@@ -92,7 +92,7 @@ CONTENT_TYPE_MAP = {
 
 def _classify_intent(text: str) -> Dict[str, Any]:
     """
-    Classify user intent using pragmatics 4-class model.
+    Classify user intent via pragmatics 4-class model.
     
     Returns:
         {"intent": "recall"|"save"|"task"|"casual", "confidence": float}
@@ -112,7 +112,7 @@ def _classify_intent(text: str) -> Dict[str, Any]:
     except Exception as e:
         print(f"[jeeves] Pragmatics API error: {e}")
     
-    # Fallback if pragmatics unavailable - very basic heuristics
+    # Fallback if pragmatics is down - very basic heuristics
     print("[jeeves] Warning: Pragmatics unavailable, using basic fallback")
     return {"intent": "casual", "confidence": 0.3}
 
@@ -636,11 +636,46 @@ async def _orchestrate_task(
     all_results: List[str] = []
     
     try:
-        # Set workspace context
+        # Reset state at start of new task
         await __event_emitter__({
             "type": "status",
             "data": {"description": "✨ Thinking...", "done": False, "hidden": False}
         })
+        
+        # Reset orchestrator state for new task
+        try:
+            requests.post(
+                f"{ORCHESTRATOR_API_URL}/api/orchestrate/reset-state",
+                timeout=5,
+            )
+        except Exception as e:
+            print(f"[jeeves] Failed to reset state: {e}")
+        
+        # Extract user info from task using spaCy NER (via pragmatics service)
+        try:
+            ner_resp = requests.post(
+                f"{PRAGMATICS_API_URL}/api/pragmatics/user-info",
+                json={"text": user_text},
+                timeout=10,
+            )
+            if ner_resp.status_code == 200:
+                user_info = ner_resp.json()
+                # Set any extracted info in orchestrator state
+                info_to_set = {}
+                if user_info.get("name"):
+                    info_to_set["name"] = user_info["name"]
+                if user_info.get("email"):
+                    info_to_set["email"] = user_info["email"]
+                
+                if info_to_set:
+                    requests.post(
+                        f"{ORCHESTRATOR_API_URL}/api/orchestrate/set-user-info",
+                        json=info_to_set,
+                        timeout=5,
+                    )
+                    print(f"[jeeves] Set user info via NER: {info_to_set}")
+        except Exception as e:
+            print(f"[jeeves] NER extraction failed: {e}")
         
         requests.post(
             f"{ORCHESTRATOR_API_URL}/api/orchestrate/set-workspace",
@@ -752,6 +787,21 @@ async def _orchestrate_task(
             output = result.get("output")
             error = result.get("error")
             
+            # Update orchestrator state with tool result
+            try:
+                requests.post(
+                    f"{ORCHESTRATOR_API_URL}/api/orchestrate/update-state",
+                    json={
+                        "tool": tool,
+                        "params": {k: v for k, v in params.items() if k not in ("content", "text", "new_text")},
+                        "output": output[:50000] if output else "",  # Limit size but include full scan output
+                        "success": success,
+                    },
+                    timeout=5,
+                )
+            except Exception as e:
+                print(f"[jeeves] Failed to update state: {e}")
+            
             # Only show errors - success is silent
             if not success:
                 error_snippet = (error[:40] + "...") if error and len(error) > 40 else (error or "unknown")
@@ -778,9 +828,7 @@ async def _orchestrate_task(
                 if tool == "scan_workspace":
                     formatted = output if output else "(no files found)"
                     all_results.append(f"""### Workspace Files ###
-**Reasoning:** {reasoning}
-
-The following is a unified listing (directories and files together, sorted alphabetically with directories first). Present this table as-is without splitting into separate sections:
+⚠️ THIS IS THE COMPLETE FILE LIST. Do not invent files not shown below.
 
 ```
 {formatted}
@@ -792,11 +840,12 @@ The following is a unified listing (directories and files together, sorted alpha
                 elif tool == "read_file":
                     path = params.get("path", "file")
                     all_results.append(f"""### File Content: {path} ###
-**Reasoning:** {reasoning}
+**ACTUAL CONTENT (do not invent or paraphrase):**
 
 ```
 {output or "(empty)"}
 ```
+⚠️ The above is the COMPLETE file content. Do not add anything not shown above.
 ### End File Content ###
 """)
                 
@@ -805,12 +854,12 @@ The following is a unified listing (directories and files together, sorted alpha
                     # Include snippet of actual content for accurate summarization
                     # Different tools use different param names for content
                     content = params.get("content") or params.get("text") or params.get("new_text") or ""
-                    content_snippet = content[:100] + "..." if len(content) > 100 else content
+                    content_snippet = content[:200] + "..." if len(content) > 200 else content
                     all_results.append(f"""### File Operation Result ###
 **Operation:** {tool} on {path}
 **Status:** ✅ Success
-**Content added:** `{content_snippet}`
-**Result:** {output or "OK"}
+**EXACT content written:** `{content_snippet}`
+⚠️ Report ONLY this exact content. Do not embellish or reformat.
 ### End File Operation ###
 """)
                 
@@ -882,7 +931,12 @@ The following is a unified listing (directories and files together, sorted alpha
             header += "### Action Log ###\n"
             
             footer = """### End Action Log ###
-Give a brief summary. Quote the EXACT content from the logs, do not paraphrase or embellish.
+
+⚠️ FINAL INSTRUCTION: Summarize ONLY what is shown in the logs above.
+- Do NOT invent file names, paths, or content
+- Do NOT add files that aren't listed
+- Do NOT make up file contents
+- If you don't see data above, say "I couldn't complete that"
 """
             return header + "\n".join(all_results) + footer
         return None

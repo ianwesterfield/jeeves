@@ -6,6 +6,8 @@ Core endpoints for the agentic reasoning engine:
   - /clone-workspace: Clone a git repo and set as workspace
   - /next-step: Generate single next step (may detect parallelization)
   - /execute-batch: Execute parallel batch; continue on individual failures
+  - /update-state: Update workspace state after tool execution
+  - /reset-state: Reset state for new task
 """
 
 import logging
@@ -31,6 +33,7 @@ from services.reasoning_engine import ReasoningEngine
 from services.task_planner import TaskPlanner
 from services.parallel_executor import ParallelExecutor
 from services.memory_connector import MemoryConnector
+from services.workspace_state import WorkspaceState, get_workspace_state, reset_workspace_state
 from utils.workspace_context import WorkspaceContextManager
 
 
@@ -205,20 +208,23 @@ async def next_step(request: NextStepRequest) -> NextStepResponse:
     """
     Generate the next reasoning step for a task.
     
-    Uses the LLM to analyze the task and history, then produces
-    either a single step or a batch of parallelizable steps.
+    Uses external WorkspaceState for ground-truth tracking (not LLM memory).
+    The state is injected into the prompt so LLM doesn't need to track it.
     
     The response includes:
       - tool: The tool to execute
       - params: Parameters for the tool
       - batch_id: If parallelizable, a batch identifier
-      - reasoning: Explanation of why this step was chosen
+      - reasoning: Short status note for the user
     """
     logger.info(f"Generating next step for task: {request.task[:50]}...")
     
     reasoning_engine = _get_reasoning_engine()
     task_planner = _get_task_planner()
     memory_connector = _get_memory_connector()
+    
+    # Get or create workspace state
+    workspace_state = get_workspace_state()
     
     # 1. Retrieve relevant patterns from memory
     memory_context = []
@@ -228,13 +234,24 @@ async def next_step(request: NextStepRequest) -> NextStepResponse:
             user_id=request.user_id,
             top_k=3,
         )
+        
+        # Extract user info from memory results and store in state
+        for mem in memory_context:
+            payload = mem.get("payload", {})
+            if payload.get("facts"):
+                facts = payload["facts"]
+                if facts.get("names"):
+                    workspace_state.user_info["name"] = facts["names"][0]
+                if facts.get("emails"):
+                    workspace_state.user_info["email"] = facts["emails"][0]
     
-    # 2. Generate next step using reasoning engine
+    # 2. Generate next step using reasoning engine with external state
     step = await reasoning_engine.generate_next_step(
         task=request.task,
         history=request.history or [],
         memory_context=memory_context,
         workspace_context=request.workspace_context,
+        workspace_state=workspace_state,  # Pass external state
     )
     
     # 3. Check if step can be parallelized
@@ -293,3 +310,124 @@ async def execute_batch(request: ExecuteBatchRequest) -> BatchResult:
     )
     
     return result
+
+# ============================================================================
+# State Management Endpoints
+# ============================================================================
+
+from pydantic import BaseModel, Field
+from typing import Dict, Any
+
+
+class UpdateStateRequest(BaseModel):
+    """Request to update workspace state after tool execution."""
+    tool: str = Field(..., description="Tool that was executed")
+    params: Dict[str, Any] = Field(default_factory=dict, description="Tool parameters")
+    output: str = Field(default="", description="Tool output")
+    success: bool = Field(..., description="Whether execution succeeded")
+
+
+class StateResponse(BaseModel):
+    """Response with current workspace state summary."""
+    scanned_paths: list
+    total_files: int
+    total_dirs: int
+    edited_files: list
+    completed_steps: int
+    user_info: Dict[str, str]
+
+
+@router.post("/update-state", response_model=StateResponse)
+async def update_state(request: UpdateStateRequest) -> StateResponse:
+    """
+    Update workspace state after a tool execution.
+    
+    Called by the filter after each tool is executed to keep
+    the external state in sync with reality.
+    """
+    state = get_workspace_state()
+    
+    # Update state based on tool result
+    state.update_from_step(
+        tool=request.tool,
+        params=request.params,
+        output=request.output,
+        success=request.success,
+    )
+    
+    logger.debug(f"State updated: {len(state.completed_steps)} steps, {len(state.files)} files")
+    
+    return StateResponse(
+        scanned_paths=list(state.scanned_paths),
+        total_files=len(state.files),
+        total_dirs=len(state.dirs),
+        edited_files=list(state.edited_files),
+        completed_steps=len(state.completed_steps),
+        user_info=state.user_info,
+    )
+
+
+@router.post("/reset-state", response_model=StateResponse)
+async def reset_state() -> StateResponse:
+    """
+    Reset workspace state for a new task.
+    
+    Called at the start of a new task to clear previous state.
+    User info is preserved across resets.
+    """
+    state = reset_workspace_state()
+    
+    logger.info("Workspace state reset")
+    
+    return StateResponse(
+        scanned_paths=[],
+        total_files=0,
+        total_dirs=0,
+        edited_files=[],
+        completed_steps=0,
+        user_info=state.user_info,
+    )
+
+
+@router.get("/state", response_model=StateResponse)
+async def get_state() -> StateResponse:
+    """
+    Get current workspace state.
+    
+    Returns the current external state for debugging/inspection.
+    """
+    state = get_workspace_state()
+    
+    return StateResponse(
+        scanned_paths=list(state.scanned_paths),
+        total_files=len(state.files),
+        total_dirs=len(state.dirs),
+        edited_files=list(state.edited_files),
+        completed_steps=len(state.completed_steps),
+        user_info=state.user_info,
+    )
+
+
+class SetUserInfoRequest(BaseModel):
+    """Request to set user info in workspace state."""
+    name: str = Field(None, description="User's name")
+    email: str = Field(None, description="User's email")
+
+
+@router.post("/set-user-info")
+async def set_user_info(request: SetUserInfoRequest) -> Dict[str, str]:
+    """
+    Set user info directly in workspace state.
+    
+    Called when user info is extracted from the task or conversation.
+    """
+    state = get_workspace_state()
+    
+    if request.name:
+        state.user_info["name"] = request.name
+    if request.email:
+        state.user_info["email"] = request.email
+    
+    logger.info(f"User info set: {state.user_info}")
+    
+    return state.user_info

@@ -1,7 +1,7 @@
 # =============================================================================
 # Jeeves Pragmatics API - Application Image
 # =============================================================================
-# Builds FROM pre-published base image (contains system deps + pip packages)
+# Builds FROM pre-published base image (contains system deps + pip packages + spaCy)
 # Only copies application code - rebuilds in ~10 seconds
 #
 # To rebuild base: see Dockerfile.base

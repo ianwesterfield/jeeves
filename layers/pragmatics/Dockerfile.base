@@ -1,7 +1,7 @@
 # =============================================================================
 # Jeeves Pragmatics API - Base Image
 # =============================================================================
-# Contains: Python 3.11 + system deps + all pip packages
+# Contains: Python 3.11 + system deps + all pip packages + spaCy model
 # Publish:  docker build -f Dockerfile.base -t <hub>/jeeves-pragmatics-base:latest .
 #           docker push <hub>/jeeves-pragmatics-base:latest
 #
@@ -20,5 +20,8 @@ WORKDIR /app
 # Python packages (the expensive layer)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# spaCy NER model (en_core_web_sm ~12MB)
+RUN python -m spacy download en_core_web_sm
 
 # Base image stops here - no application code

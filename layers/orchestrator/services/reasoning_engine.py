@@ -3,6 +3,11 @@ Reasoning Engine - LLM Coordination for Step Generation
 
 Uses Ollama to generate structured reasoning steps from user intents.
 Parses LLM output into validated Step objects.
+
+Architecture:
+- State is maintained EXTERNALLY by WorkspaceState (not by the LLM)
+- LLM receives state as context, only outputs next step
+- This prevents state drift and reduces token cost
 """
 
 import os
@@ -12,6 +17,7 @@ import httpx
 from typing import Any, Dict, List, Optional
 
 from schemas.models import Step, StepResult, WorkspaceContext
+from services.workspace_state import WorkspaceState, get_workspace_state
 
 
 logger = logging.getLogger("orchestrator.reasoning")
@@ -21,55 +27,80 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 
 
-SYSTEM_PROMPT = """You are Jeeves, an agentic AI assistant that executes tasks step by step.
+SYSTEM_PROMPT = """You are Jeeves, an agentic AI that executes repository tasks step-by-step.
 
-You must respond with JSON containing the NEXT step to execute.
+Respond with JSON for the NEXT step only. No markdown, no extra text.
 
-CRITICAL: If the task references information you don't have (like "my name" but no name was provided),
-return: {"tool": "complete", "params": {"error": "I don't know your name. Please tell me your name first."}}
-NEVER make up or guess user information - only use what is explicitly provided.
+=== OUTPUT FORMAT (JSON ONLY) ===
 
-Available tools:
+{"tool": "tool_name", "params": {...}, "note": "Brief status for user"}
+
+- "note" is a SHORT operator-facing status (not reasoning/chain-of-thought)
+- Do NOT include state tracking - the orchestrator maintains state externally
+
+=== MISSING INFO RULE ===
+
+If the task references info you don't have (e.g. "my name" but not provided):
+{"tool": "complete", "params": {"error": "MISSING_INFO: I don't know your name."}, "note": "Need info"}
+
+NEVER guess or fabricate user information.
+
+=== AVAILABLE TOOLS ===
+
 - scan_workspace: List files. Params: {"path": "string"}
-- read_file: Read file. Params: {"path": "string"}  
-- write_file: Overwrite file. Params: {"path": "string", "content": "string"}
-- replace_in_file: Find/replace. Params: {"path": "string", "old_text": "string", "new_text": "string"}
-- insert_in_file: Insert at position. Params: {"path": "string", "position": "start"|"end", "text": "string"}
-- append_to_file: Add to end. Params: {"path": "string", "content": "string"}
+- read_file: Read file. Params: {"path": "string"}
+- write_file: Create/overwrite file. Params: {"path": "string", "content": "string"}
+- replace_in_file: Find/replace EXISTING text. Params: {"path": "string", "old_text": "string", "new_text": "string"}
+- insert_in_file: ADD NEW text at start or end. Params: {"path": "string", "position": "start"|"end", "text": "string"}
+- append_to_file: Append to end. Params: {"path": "string", "content": "string"}
 - execute_shell: Run shell command. Params: {"command": "string"}
-- complete: Done. Params: {} or {"error": "reason"}
+- none: Skip (change already present). Params: {"reason": "string"}
+- complete: Done. Params: {} OR {"error": "reason"}
 
-Response format (JSON only):
-{"tool": "tool_name", "params": {...}, "reasoning": "why"}
+⚠️ CRITICAL - INSERT vs REPLACE:
+- To ADD NEW text (comment, header, etc.) → use insert_in_file with position="start" or "end"
+- To CHANGE EXISTING text you SAW in the file → use replace_in_file
+- replace_in_file WILL FAIL if old_text is not found - it cannot add new content!
+- If you need to add a comment/header that DOES NOT EXIST, you MUST use insert_in_file
+- ALWAYS include a trailing newline in inserted text: "<!-- Comment -->\\n" not "<!-- Comment -->"
+- For Markdown files (.md), use HTML comment syntax: <!-- Author: Name -->
 
 === CRITICAL RULES ===
 
-1. NEVER scan the same path twice. Check COMPLETED STEPS first.
-2. If scan_workspace already succeeded for a path, USE THAT OUTPUT.
-3. Process files in order - don't skip or re-scan.
-4. Work silently - the user sees status updates, not your reasoning.
-5. When done, return {"tool": "complete", "params": {}, "reasoning": "done"}
-6. If you cannot perform a task with available tools, use complete with {"error": "reason"}.
-7. **PATHS MUST BE EXACT** - Use the FULL path from scan results. If scan shows ".github/file.md", use ".github/file.md" NOT "file.md".
+1. PATH DISCIPLINE: Use EXACT paths from workspace state. Never invent paths.
+   - Correct: ".github/copilot-instructions.md"
+   - WRONG: "copilot-instructions.md" (missing directory)
 
-=== SHELL COMMAND EXAMPLES ===
+2. NO RESCANS: If workspace state shows files, don't scan again.
 
-Git operations:
-- Create branch: {"tool": "execute_shell", "params": {"command": "git checkout -b feature/new-feature"}}
-- Switch branch: {"tool": "execute_shell", "params": {"command": "git checkout main"}}
-- Check status: {"tool": "execute_shell", "params": {"command": "git status"}}
-- Stage files: {"tool": "execute_shell", "params": {"command": "git add ."}}
-- Commit: {"tool": "execute_shell", "params": {"command": "git commit -m 'description'"}}
-- Undo unstaged changes: {"tool": "execute_shell", "params": {"command": "git checkout -- ."}}
-  Note: NEVER use "git checkout HEAD" as it discards staged work.
-- View diff: {"tool": "execute_shell", "params": {"command": "git diff"}}
-- List branches: {"tool": "execute_shell", "params": {"command": "git branch -a"}}
+3. NO RE-READS: If state shows "Already read" a file, DO NOT read it again. Move to editing.
 
-=== FILE OPERATION EXAMPLES ===
+3. MINIMAL EDITS: Prefer insert_in_file/replace_in_file over write_file.
 
-IMPORTANT: Always use the FULL relative path including directories.
-- Correct: {"tool": "insert_in_file", "params": {"path": ".github/file.md", "position": "start", "text": "# Comment\\n"}}
-- WRONG: {"tool": "insert_in_file", "params": {"path": "file.md", ...}}  ← Missing directory!
+4. ONE STEP: Return exactly one action. Don't bundle multiple operations.
+
+5. PRIORITY ORDER:
+   a) If no scan exists → scan_workspace(".")
+   b) If task mentions file → locate in state, read if needed, then edit
+   c) After all edits → complete
+
+=== SHELL EXAMPLES ===
+
+Git: {"tool": "execute_shell", "params": {"command": "git status"}}
+     {"tool": "execute_shell", "params": {"command": "git checkout -b feature/x"}}
+     {"tool": "execute_shell", "params": {"command": "git add . && git commit -m 'msg'"}}
+
+=== LOOP DETECTION ===
+
+If you see a step you just completed in "Completed steps", DO NOT repeat it.
+If task is "list/scan files" and you already did scan_workspace → {"tool": "complete", "params": {}, "note": "Done"}
+If task is "read file X" and X is in "Already read" → {"tool": "complete", "params": {}, "note": "Already read"}
+If you can't make progress → {"tool": "complete", "params": {"error": "Cannot complete task"}, "note": "Stuck"}
+
+=== COMPLETION ===
+
+When finished: {"tool": "complete", "params": {}, "note": "Done"}
+On error: {"tool": "complete", "params": {"error": "reason"}, "note": "Failed"}
 """
 
 
@@ -77,7 +108,10 @@ class ReasoningEngine:
     """
     LLM-powered reasoning engine for step generation.
     
-    Coordinates with Ollama to generate structured steps from natural language tasks.
+    Architecture:
+    - State is maintained externally by WorkspaceState
+    - LLM receives state as context, only outputs the next step
+    - This prevents hallucination and state drift
     """
     
     def __init__(self):
@@ -91,164 +125,46 @@ class ReasoningEngine:
         history: List[StepResult],
         memory_context: List[Dict[str, Any]],
         workspace_context: Optional[WorkspaceContext] = None,
+        workspace_state: Optional[WorkspaceState] = None,
     ) -> Step:
         """
         Generate the next step for a task using LLM reasoning.
         
         Args:
             task: User's task description
-            history: Previous step results
+            history: Previous step results (for backward compat, prefer workspace_state)
             memory_context: Relevant patterns from memory
             workspace_context: Current workspace settings
+            workspace_state: External state (ground truth from actual tool outputs)
             
         Returns:
             Step object with tool, params, and reasoning
         """
-        # Build context prompt
+        # Use external state if provided, otherwise fall back to old approach
+        if workspace_state is None:
+            workspace_state = get_workspace_state()
+        
         context_parts = []
         
-        # DEBUG: Log history summary (not individual steps)
-        if history:
-            success_count = sum(1 for h in history if h.status.value == "success")
-            logger.info(f"History: {len(history)} steps ({success_count} successful)")
+        # 1. Inject external state (the key change - LLM doesn't maintain this)
+        state_context = workspace_state.format_for_prompt()
+        if state_context:
+            context_parts.append(state_context)
         
-        # GUARDRAIL: Detect repeated scanning and force completion
-        if history:
-            scan_count = sum(1 for h in history if h.tool == "scan_workspace")
-            
-            # Track which files have already been edited
-            already_edited = set()
-            for h in history:
-                if h.tool in ("insert_in_file", "replace_in_file", "write_file", "append_to_file"):
-                    path = h.params.get("path", "") if h.params else ""
-                    if path:
-                        already_edited.add(path)
-            
-            if scan_count >= 3:
-                # Model is stuck in a scan loop - extract file list and force next action
-                logger.warning(f"GUARDRAIL: {scan_count} scans, {len(already_edited)} files edited")
-                
-                # Collect all files found from scans
-                all_files = set()
-                for h in history:
-                    if h.tool == "scan_workspace" and h.output:
-                        # Extract file paths from scan output
-                        # Format: NAME  TYPE  SIZE  MODIFIED
-                        for line in h.output.split("\n"):
-                            line = line.strip()
-                            # Skip headers, separators, and metadata
-                            if not line or line.startswith("PATH:") or line.startswith("TOTAL:"):
-                                continue
-                            if line.startswith("-") or line.startswith("NAME"):
-                                continue
-                            if line.startswith("..."):
-                                continue
-                            
-                            # Parse the columns: NAME  TYPE  SIZE  MODIFIED
-                            parts = line.split()
-                            if len(parts) >= 2:
-                                name = parts[0]
-                                entry_type = parts[1] if len(parts) > 1 else ""
-                                if entry_type == "file":
-                                    all_files.add(name)
-                
-                # Filter to editable files only
-                editable_extensions = ['.md', '.py', '.js', '.ts', '.yaml', '.yml', '.json', '.txt', '.sh', '.ps1', '.mmd']
-                binary_extensions = ['.png', '.jpg', '.gif', '.bin', '.exe', '.dll', '.pyc', '.pth', '.safetensors']
-                
-                editable_files = set()
-                for f in all_files:
-                    if any(f.endswith(ext) for ext in binary_extensions):
-                        continue
-                    if any(f.endswith(ext) for ext in editable_extensions):
-                        editable_files.add(f)
-                
-                # Remove already-edited files
-                remaining_files = editable_files - already_edited
-                
-                logger.info(f"GUARDRAIL: {len(editable_files)} editable, {len(already_edited)} done, {len(remaining_files)} remaining")
-                
-                # Extract user's name from task if present
-                # Look for patterns like "by Name", "name: Name", or just "FirstName LastName"
-                import re
-                
-                # Common words that look like names but aren't
-                not_names = {'Add', 'Edit', 'Update', 'Change', 'Remove', 'Delete', 'Create', 
-                             'Make', 'Fix', 'Set', 'Get', 'Put', 'Can', 'Could', 'Would', 
-                             'Should', 'Please', 'Each', 'Every', 'All', 'The', 'This', 'That',
-                             'Updated', 'As', 'To', 'For', 'From', 'With', 'Of', 'No', 'Yes',
-                             'Ok', 'Okay', 'Sure', 'Thanks', 'Hello', 'Hi', 'Hey', 'Let', 'Me',
-                             'My', 'Your', 'Name', 'User', 'File', 'Files', 'Comment', 'Comments'}
-                
-                name_match = re.search(r'(?:name[:\s]+|by\s+)([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)', task)
-                if name_match:
-                    author_name = name_match.group(1)
-                else:
-                    # Find all capitalized words, filter out non-names, take first consecutive pair
-                    cap_words = re.findall(r'\b([A-Z][a-z]+)\b', task)
-                    name_words = [w for w in cap_words if w not in not_names]
-                    if len(name_words) >= 2:
-                        author_name = f"{name_words[0]} {name_words[1]}"
-                    elif len(name_words) == 1:
-                        author_name = name_words[0]
-                    else:
-                        author_name = "Author"
-                
-                logger.info(f"GUARDRAIL: Extracted author name: {author_name}")
-                
-                # If we have files and it's an edit task, force an edit on NEXT unedited file
-                task_lower = task.lower()
-                if remaining_files and ("add" in task_lower or "edit" in task_lower or "comment" in task_lower or "name" in task_lower):
-                    next_file = sorted(remaining_files)[0]
-                    
-                    # Determine comment style based on file extension
-                    if next_file.endswith('.py') or next_file.endswith('.ps1') or next_file.endswith('.sh') or next_file.endswith('.yaml') or next_file.endswith('.yml') or next_file.endswith('.txt'):
-                        comment_text = f"# {author_name}\n"
-                    elif next_file.endswith('.md') or next_file.endswith('.mmd'):
-                        comment_text = f"<!-- {author_name} -->\n"
-                    elif next_file.endswith('.js') or next_file.endswith('.ts') or next_file.endswith('.json'):
-                        comment_text = f"// {author_name}\n"
-                    else:
-                        comment_text = f"# {author_name}\n"
-                    
-                    logger.info(f"GUARDRAIL: Editing {next_file} with '{comment_text.strip()}'")
-                    return Step(
-                        step_id="guardrail_edit",
-                        tool="insert_in_file",
-                        params={
-                            "path": next_file,
-                            "position": "start",
-                            "text": comment_text
-                        },
-                        reasoning=f"Editing file {len(already_edited)+1}/{len(editable_files)}: {next_file}",
-                    )
-                
-                # All files edited or no editable files - complete!
-                if already_edited:
-                    logger.info(f"GUARDRAIL: All {len(already_edited)} files edited - completing")
-                    return Step(
-                        step_id="guardrail_complete",
-                        tool="complete",
-                        params={},
-                        reasoning=f"Completed editing {len(already_edited)} files",
-                    )
-                
-                # No actionable files found
-                logger.info("GUARDRAIL: No actionable files found - completing")
-                return Step(
-                    step_id="guardrail_complete",
-                    tool="complete",
-                    params={"error": "No editable files found matching task"},
-                    reasoning="No editable files found in scanned directories",
-                )
-        
+        # 2. Workspace permissions
         if workspace_context:
             context_parts.append(
                 f"Workspace: {workspace_context.cwd}\n"
-                f"Available languages: {', '.join(workspace_context.allowed_languages)}\n"
-                f"Parallel enabled: {workspace_context.parallel_enabled}"
+                f"Permissions: write={workspace_context.allow_file_write}, "
+                f"shell={workspace_context.allow_shell_commands}"
             )
         
+        # 3. User info from state (name, etc.)
+        if workspace_state.user_info:
+            user_info_text = "\n".join(f"  {k}: {v}" for k, v in workspace_state.user_info.items())
+            context_parts.append(f"User info (use this, don't guess):\n{user_info_text}")
+        
+        # 4. Memory patterns (optional)
         if memory_context:
             patterns = "\n".join([
                 f"- {p.get('description', 'Similar task')}: {p.get('approach', '')}"
@@ -256,24 +172,21 @@ class ReasoningEngine:
             ])
             context_parts.append(f"Relevant patterns from memory:\n{patterns}")
         
-        if history:
-            history_lines = []
-            for i, r in enumerate(history[-10:]):  # Show more history (was 5)
-                status_icon = "✓" if r.status.value == "success" else "✗"
-                tool_info = f"{r.tool}({r.params})" if r.tool else "unknown"
-                output_preview = ""
-                if r.output:
-                    # Show MORE output for scan results so LLM sees file list
-                    preview_len = 2000 if r.tool == "scan_workspace" else 500
-                    output_preview = r.output[:preview_len]
-                    if len(r.output) > preview_len:
-                        output_preview += f"... ({len(r.output) - preview_len} more chars)"
-                elif r.error:
-                    output_preview = f"ERROR: {r.error[:300]}"
-                history_lines.append(f"{status_icon} {tool_info}\n   Output: {output_preview}")
-            
-            history_text = "\n".join(history_lines)
-            context_parts.append(f"COMPLETED STEPS (don't repeat these):\n{history_text}")
+        # 5. GUARDRAIL: If too many steps without progress, force completion
+        if len(workspace_state.completed_steps) >= 15:
+            logger.warning(f"GUARDRAIL: {len(workspace_state.completed_steps)} steps - forcing completion check")
+            # Check if we're making progress
+            recent_edits = sum(1 for s in workspace_state.completed_steps[-5:] 
+                             if s.tool in ("write_file", "insert_in_file", "replace_in_file", "append_to_file")
+                             and s.success)
+            if recent_edits == 0:
+                # Not making progress - complete
+                return Step(
+                    step_id="guardrail_complete",
+                    tool="complete",
+                    params={"error": "Too many steps without progress"},
+                    reasoning="Forced completion after 15 steps without recent edits",
+                )
         
         context = "\n\n".join(context_parts)
         
@@ -282,14 +195,71 @@ class ReasoningEngine:
         if context:
             user_message = f"{context}\n\n{user_message}"
         
+        # Log prompt size (helpful for debugging)
+        logger.debug(f"Prompt size: {len(user_message)} chars")
+        
         # Call Ollama
         try:
             response = await self._call_ollama(user_message)
             step = self._parse_response(response, task)
+            
+            # GUARDRAIL: Detect repeated replace_in_file failures on same file
+            if step.tool == "replace_in_file":
+                path = step.params.get("path", "")
+                # Count recent failures on this file
+                recent_failures = sum(
+                    1 for s in workspace_state.completed_steps[-5:]
+                    if s.tool == "replace_in_file" 
+                    and s.params.get("path") == path
+                    and not s.success
+                )
+                if recent_failures >= 2:
+                    logger.warning(f"GUARDRAIL: {recent_failures} replace failures on {path} - switching to insert_in_file")
+                    # Convert to insert_in_file at start
+                    return Step(
+                        step_id="guardrail_use_insert",
+                        tool="insert_in_file",
+                        params={
+                            "path": path,
+                            "position": "start",
+                            "text": step.params.get("new_text", ""),
+                        },
+                        reasoning=f"Auto-corrected: replace_in_file failed {recent_failures}x, using insert_in_file instead",
+                    )
+            
+            # GUARDRAIL: Prevent re-reading already read files
+            if step.tool == "read_file":
+                path = step.params.get("path", "")
+                if path and path in workspace_state.read_files:
+                    logger.warning(f"GUARDRAIL: Blocking re-read of '{path}'")
+                    # Skip this step - return a prompt to move on
+                    return Step(
+                        step_id="guardrail_no_reread",
+                        tool="complete",
+                        params={"error": f"Already read {path}. Move to editing or complete."},
+                        reasoning=f"Blocked re-read of already-read file: {path}",
+                    )
+            
+            # GUARDRAIL: Validate paths exist in state
+            if step.tool in ("read_file", "write_file", "insert_in_file", "replace_in_file", "append_to_file"):
+                path = step.params.get("path", "")
+                if path and workspace_state.files and path not in workspace_state.files:
+                    # Path doesn't exist in scanned files - could be a hallucination
+                    # Check if it's a new file being created
+                    if step.tool != "write_file":
+                        logger.warning(f"GUARDRAIL: Path '{path}' not in scanned files")
+                        # Try to find similar path
+                        similar = [f for f in workspace_state.files if f.endswith(path) or path in f]
+                        if similar:
+                            # Suggest the correct path
+                            correct_path = similar[0]
+                            logger.info(f"GUARDRAIL: Correcting path to '{correct_path}'")
+                            step.params["path"] = correct_path
+            
             return step
+            
         except Exception as e:
             logger.error(f"Reasoning engine error: {e}")
-            # Return a safe fallback step
             return Step(
                 step_id="error_fallback",
                 tool="complete",
@@ -329,11 +299,14 @@ class ReasoningEngine:
             import uuid
             step_id = f"step_{uuid.uuid4().hex[:8]}"
             
+            # Accept either "note" (new) or "reasoning" (backward compat)
+            note = data.get("note", "") or data.get("reasoning", "")
+            
             return Step(
                 step_id=step_id,
                 tool=data.get("tool", "unknown"),
                 params=data.get("params", {}),
-                reasoning=data.get("reasoning", ""),
+                reasoning=note,  # Store note in reasoning field for compat
                 batch_id=data.get("batch_id"),
             )
         except json.JSONDecodeError as e:

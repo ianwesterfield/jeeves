@@ -56,11 +56,11 @@ jeeves/
 ### Orchestrator Service (layers/orchestrator/)
 
 - **FastAPI app:** `main.py` on port 8004
-- **Model:** Devstral-Small-2:24B via Ollama (env: `OLLAMA_MODEL`)
-- **Router:** `api/orchestrator.py` - set-workspace, next-step, execute-batch
-- **Services:** reasoning_engine.py, task_planner.py, parallel_executor.py, memory_connector.py
+- **Model:** qwen2.5:14b via Ollama (env: `OLLAMA_MODEL`)
+- **Router:** `api/orchestrator.py` - set-workspace, next-step, execute-batch, update-state, reset-state
+- **Services:** reasoning_engine.py, code_planner.py, task_planner.py, parallel_executor.py, memory_connector.py, workspace_state.py
 - **Feedback Loop:** Filter passes step history back to orchestrator for multi-step reasoning
-- **Max Steps:** 10 iterations before forced completion
+- **Max Steps:** 15 iterations before forced completion
 
 ### Executor Service (layers/executor/)
 
@@ -76,11 +76,18 @@ jeeves/
   - `append_to_file` - Add to end of file
   - `list_files` - Directory listing
   - `scan_workspace` - Recursive search with gitignore support, pretty table output (NAME/TYPE/SIZE/MODIFIED)
+  - `none` - Idempotent skip (change already present)
+
+### Pragmatics Service (layers/pragmatics/)
+
+- **Intent classification:** DistilBERT 4-class (casual/save/recall/task)
+- **Entity extraction:** spaCy NER (`en_core_web_sm`) for names, orgs, dates, emails
+- **Endpoints:** `/api/pragmatics/classify`, `/api/pragmatics/entities`, `/api/pragmatics/user-info`
 
 ### Extractor Service (layers/extractor/)
 
-- **Image extraction:** Uses LLaVA-1.5-7B (4-bit) or Florence-2 fallback
-- **Audio extraction:** Whisper for transcription
+- **Image extraction:** Uses LLaVA (full) via Ollama, or Florence-2 fallback
+- **Audio extraction:** Whisper large-v3 for transcription
 - **PDF extraction:** PyMuPDF
 
 ## Conventions & Patterns
@@ -138,7 +145,7 @@ jeeves/
 
 ### Memory Service
 
-- Do not change collection params unless migrating existing data
+- Don't change collection params unless migrating existing data
 - Keep embedding model and dim in sync (768-dim)
 - Preserve `Message` shape and mixed `content` handling
 

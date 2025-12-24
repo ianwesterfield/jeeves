@@ -1,26 +1,28 @@
 """
-Pragmatics Service - Intent Classification for Jeeves
+Pragmatics Service - Intent Classification & Entity Extraction for Jeeves
 
 Multi-class intent classification for conversation routing.
+Named entity recognition for extracting user info.
 
 Endpoints:
   POST /api/pragmatics/classify - Full 4-class classification (recommended)
+  POST /api/pragmatics/entities - Named entity extraction (names, orgs, dates, emails)
   POST /api/pragmatic - Binary save detection (backward compatible)
 
-Model:
-  DistilBERT fine-tuned on conversation intents.
-  4-class labels: casual, save, recall, task
-  Confidence threshold configurable via INTENT_CONFIDENCE_THRESHOLD
+Models:
+  - Intent: DistilBERT fine-tuned on conversation intents (4-class: casual/save/recall/task)
+  - NER: spaCy en_core_web_sm for entity extraction
 """
 
 import logging
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from services.classifier import classify_intent, classify_intent_multiclass, classify_with_context
+from services.entity_extractor import extract_entities_dict, extract_user_info
 
 
 # ============================================================================
@@ -182,6 +184,91 @@ async def classify_with_conversation_context(request: ContextClassifyRequest) ->
     
     except Exception as exc:
         logger.error(f"[classify-ctx] Error: {exc} | text: {text_preview}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ============================================================================
+# Entity Extraction Endpoints
+# ============================================================================
+
+class EntitiesRequest(BaseModel):
+    """Request to extract entities from text."""
+    text: str = Field(..., min_length=1, max_length=10000)
+
+
+class EntitiesResponse(BaseModel):
+    """Extracted named entities."""
+    names: List[str] = Field(default_factory=list, description="Person names")
+    organizations: List[str] = Field(default_factory=list, description="Organization names")
+    dates: List[str] = Field(default_factory=list, description="Date expressions")
+    emails: List[str] = Field(default_factory=list, description="Email addresses")
+    locations: List[str] = Field(default_factory=list, description="Places, cities, countries")
+    money: List[str] = Field(default_factory=list, description="Monetary values")
+    times: List[str] = Field(default_factory=list, description="Time expressions")
+
+
+class UserInfoResponse(BaseModel):
+    """User-specific info extracted from text."""
+    name: Optional[str] = Field(None, description="First person name found")
+    email: Optional[str] = Field(None, description="First email found")
+    organization: Optional[str] = Field(None, description="First organization found")
+
+
+@app.post("/api/pragmatics/entities", response_model=EntitiesResponse)
+async def extract_entities_endpoint(request: EntitiesRequest) -> EntitiesResponse:
+    """
+    Extract named entities from text using spaCy NER.
+    
+    Returns categorized lists of:
+      - names: Person names (John Doe, Dr. Smith)
+      - organizations: Companies, institutions
+      - dates: Date expressions (tomorrow, Jan 1st, 2024)
+      - emails: Email addresses
+      - locations: Cities, countries, places
+      - money: Monetary values ($100, 50 euros)
+      - times: Time expressions (3pm, noon)
+    """
+    start_time = time.time()
+    text_preview = request.text[:100] if len(request.text) > 100 else request.text
+    
+    try:
+        entities = extract_entities_dict(request.text)
+        duration_ms = int((time.time() - start_time) * 1000)
+        
+        entity_counts = {k: len(v) for k, v in entities.items() if v}
+        logger.info(f"[entities] ms={duration_ms} found={entity_counts} text='{text_preview}'")
+        
+        return EntitiesResponse(**entities)
+    
+    except Exception as exc:
+        logger.error(f"[entities] Error: {exc} | text: {text_preview}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/pragmatics/user-info", response_model=UserInfoResponse)
+async def extract_user_info_endpoint(request: EntitiesRequest) -> UserInfoResponse:
+    """
+    Extract user-specific info from text.
+    
+    Convenience endpoint that returns the first name/email/org found.
+    Useful for populating user profile or workspace state.
+    
+    Example: "My name is John Doe and I work at Acme Corp"
+    → {"name": "John Doe", "email": null, "organization": "Acme Corp"}
+    """
+    start_time = time.time()
+    text_preview = request.text[:100] if len(request.text) > 100 else request.text
+    
+    try:
+        user_info = extract_user_info(request.text)
+        duration_ms = int((time.time() - start_time) * 1000)
+        
+        logger.info(f"[user-info] ms={duration_ms} info={user_info} text='{text_preview}'")
+        
+        return UserInfoResponse(**user_info)
+    
+    except Exception as exc:
+        logger.error(f"[user-info] Error: {exc} | text: {text_preview}")
         raise HTTPException(status_code=500, detail=str(exc))
 
 

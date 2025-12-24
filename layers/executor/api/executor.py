@@ -71,7 +71,28 @@ def _get_permission_checker() -> PermissionChecker:
 # Tool Registry
 # ============================================================================
 
+
+async def _handle_none(req) -> dict:
+    """
+    Handle 'none' action - no change needed (idempotent skip).
+    
+    Returns success immediately without any file operations.
+    Used when the code planner determines the change is already present.
+    """
+    reason = req.params.get("reason", "no change needed")
+    path = req.params.get("path", "")
+    return {
+        "success": True,
+        "output": f"Skipped: {reason}" + (f" ({path})" if path else ""),
+        "skipped": True,
+        "reason": reason,
+    }
+
+
 TOOL_HANDLERS = {
+    # No-op handler for idempotent operations
+    "none": _handle_none,
+    
     "execute_code": lambda req: _get_polyglot_handler().execute(
         language=req.params.get("language", "python"),
         code=req.params.get("code", ""),

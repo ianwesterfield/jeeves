@@ -15,8 +15,17 @@ __pycache__/
 .git/
 .gitignore
 
-# Training checkpoints (keep only final model)
+# Training checkpoints (keep only final models)
 static/distilbert_memory_output/
+static/distilbert_intent_output/
+**/checkpoint-*/
+
+# Training artifacts (optimizer states, etc.)
+*.pt
+optimizer.pt
+scheduler.pt
+rng_state.pth
+scaler.pt
 
 # Tests
 tests/

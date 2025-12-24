@@ -1,17 +1,17 @@
 # Jeeves
 
-An agentic AI assistant for Open-WebUI with semantic memory, intent classification, workspace operations, and file editing capabilities.
+My agentic AI assistant for Open-WebUI. Handles semantic memory, intent classification, workspace ops, and surgical file editing.
 
 ## What It Does
 
-Jeeves acts as an intelligent filter between you and your LLM. It:
+Jeeves sits between you and your LLM as an intelligent filter. It:
 
-1. **Classifies Intent** — Determines if you're asking casually, saving info, recalling memories, or requesting a task
-2. **Manages Memory** — Stores facts, documents, and image descriptions; retrieves relevant context automatically
-3. **Executes Workspace Operations** — Can read, list, and **edit** files in your workspace
-4. **Surgical File Editing** — Supports append, replace, and insert operations on files
+1. **Classifies Intent** — Figures out if you're chatting casually, saving info, recalling memories, or asking for a task
+2. **Manages Memory** — Stores facts, docs, and image descriptions; pulls relevant context automatically
+3. **Runs Workspace Ops** — Can read, list, and **edit** files in your workspace
+4. **Surgical Edits** — Supports append, replace, and insert operations on files
 
-**Key Capabilities:**
+**What it can do:**
 
 - `read` — View file contents
 - `list` — Browse workspace structure
@@ -19,7 +19,7 @@ Jeeves acts as an intelligent filter between you and your LLM. It:
 - `replace` — Find and replace text in files
 - `insert` — Insert text at specific positions
 
-**Example Commands:**
+**Example prompts:**
 
 ```
 "Show me the readme"
@@ -50,39 +50,39 @@ User message → Jeeves Filter → Intent Classification (Pragmatics)
               LLM Response
 ```
 
-**Key principle:** All task intents are delegated to the Orchestrator for reasoning - no shortcut patterns in the filter.
+**Key principle:** All task intents go to the Orchestrator for reasoning—no shortcut patterns in the filter.
 
 ## Services
 
-| Service            | Port  | Purpose                                |
+| Service            | Port  | What it does                           |
 | ------------------ | ----- | -------------------------------------- |
 | `jeeves`           | 8000  | Agent core + semantic memory           |
 | `pragmatics_api`   | 8001  | 4-class intent classifier (DistilBERT) |
 | `extractor_api`    | 8002  | Image/audio/PDF extraction (GPU)       |
 | `orchestrator_api` | 8004  | Multi-step reasoning engine            |
-| `executor_api`     | 8005  | File operations + code execution       |
+| `executor_api`     | 8005  | File ops + code execution              |
 | `qdrant`           | 6333  | Vector database                        |
 | `ollama`           | 11434 | Local LLM inference                    |
 | `open-webui`       | 8180  | Chat UI (filter runs here)             |
 
 ## Intent Classification
 
-The pragmatics service uses a fine-tuned DistilBERT model (98% accuracy) to classify user intent:
+Pragmatics uses a fine-tuned DistilBERT (98% accuracy) to classify what you want:
 
-| Intent   | Description                    | Example                     |
-| -------- | ------------------------------ | --------------------------- |
-| `casual` | General chat, no action needed | "How are you?"              |
-| `save`   | User sharing info to remember  | "My name is Ian"            |
-| `recall` | User asking about past info    | "What's my email?"          |
-| `task`   | User requesting an action      | "Add credits to the readme" |
+| Intent   | What it means            | Example                     |
+| -------- | ------------------------ | --------------------------- |
+| `casual` | Just chatting, no action | "How are you?"              |
+| `save`   | Sharing info to remember | "My name is Ian"            |
+| `recall` | Asking about past info   | "What's my email?"          |
+| `task`   | Requesting an action     | "Add credits to the readme" |
 
 ## File Operations
 
-All task requests are delegated to the Orchestrator, which reasons about the request and selects the appropriate tool. The Executor API then performs the operation.
+All task requests go to the Orchestrator, which reasons about what you want and picks the right tool. The Executor then does the actual work.
 
-### Executor API Tools
+### Executor Tools
 
-| Tool              | Description                                          |
+| Tool              | What it does                                         |
 | ----------------- | ---------------------------------------------------- |
 | `read_file`       | Read file contents                                   |
 | `write_file`      | Overwrite entire file                                |
@@ -91,6 +91,7 @@ All task requests are delegated to the Orchestrator, which reasons about the req
 | `append_to_file`  | Append to end of file                                |
 | `list_files`      | List directory contents                              |
 | `scan_workspace`  | Recursive search with gitignore, pretty table output |
+| `none`            | Skip (change already present)                        |
 
 ### scan_workspace Output
 
@@ -112,32 +113,32 @@ docker-compose.yaml                       file    6.36 KiB  2025-12-23 03:55:25
 ### Quick Start
 
 ```powershell
-# Start everything
+# Spin everything up
 docker compose up -d --build
 
 # Check status
 docker ps
 
-# View logs
+# Tail logs
 docker logs jeeves -f
 docker logs executor_api -f
 ```
 
 ### Environment Variables
 
-| Variable              | Default             | Purpose                              |
+| Variable              | Default             | What it's for                        |
 | --------------------- | ------------------- | ------------------------------------ |
 | `HOST_WORKSPACE_PATH` | `C:/Code`           | Host directory mounted to /workspace |
 | `QDRANT_HOST`         | `qdrant`            | Vector database host                 |
-| `OLLAMA_MODEL`        | `llama3.2`          | Default LLM for orchestration        |
+| `OLLAMA_MODEL`        | `qwen2.5:14b`       | LLM for orchestration                |
 | `CLASSIFIER_MODEL`    | `distilbert_intent` | Intent classifier model              |
 
 ### Filter Sync
 
-The Jeeves filter runs inside Open-WebUI (stored in database, not mounted volume). To sync changes:
+The Jeeves filter runs inside Open-WebUI (stored in DB, not mounted). To sync changes:
 
 ```powershell
-# Sync filter to Open-WebUI (use utf-8-sig to strip BOM)
+# Push filter to Open-WebUI (utf-8-sig strips BOM)
 $apiKey = (Get-Content "secrets/webui_admin_api_key.txt" -Raw).Trim()
 python -c "import requests; f=open('filters/jeeves.filter.py',encoding='utf-8-sig').read(); r=requests.post('http://localhost:8180/api/v1/functions/id/api/update', headers={'Authorization':'Bearer $apiKey'}, json={'id':'api','name':'Jeeves','content':f,'meta':{'toggle':True}}, timeout=10); print(r.status_code)"
 ```
@@ -146,19 +147,24 @@ python -c "import requests; f=open('filters/jeeves.filter.py',encoding='utf-8-si
 
 ```
 jeeves/
-├── docker-compose.yaml       # Full stack definition
+├── docker-compose.yaml       # Full stack
 ├── filters/
-│   └── jeeves.filter.py      # Open-WebUI filter (edit detection, workspace ops)
+│   └── jeeves.filter.py      # Open-WebUI filter (intent routing, workspace ops)
 ├── layers/
-│   ├── memory/               # Semantic memory service (port 8000)
+│   ├── memory/               # Semantic memory (port 8000)
 │   │   ├── api/memory.py     # /save, /search endpoints
 │   │   └── services/         # Embedder, Qdrant, Summarizer
 │   ├── pragmatics/           # Intent classifier (port 8001)
-│   │   └── services/classifier.py  # 4-class DistilBERT
+│   │   └── services/
+│   │       ├── classifier.py       # 4-class DistilBERT
+│   │       └── entity_extractor.py # spaCy NER
 │   ├── extractor/            # Media extraction (port 8002)
-│   │   └── services/         # Image (LLaVA), Audio (Whisper), PDF
+│   │   └── services/         # LLaVA, Whisper, PDF
 │   ├── orchestrator/         # Reasoning engine (port 8004)
-│   │   └── services/         # Task planning, parallel execution
+│   │   └── services/
+│   │       ├── reasoning_engine.py # LLM step generation
+│   │       ├── code_planner.py     # Specialist for code edits
+│   │       └── workspace_state.py  # External state tracking
 │   └── executor/             # Code/file execution (port 8005)
 │       └── services/
 │           ├── file_handler.py      # read, write, replace, insert, append
@@ -173,12 +179,12 @@ jeeves/
 ### 1. Filter Inlet (jeeves.filter.py)
 
 ```python
-# User says: "list the files in this workspace"
+# You say: "list the files in this workspace"
 #
 # 1. Intent classified as "task" (99% confidence)
-# 2. Task delegated to Orchestrator for reasoning
-# 3. Orchestrator decides: scan_workspace tool
-# 4. Executor API executes scan with gitignore support
+# 2. Task goes to Orchestrator for reasoning
+# 3. Orchestrator picks: scan_workspace tool
+# 4. Executor runs scan with gitignore support
 # 5. Pretty-formatted table injected into context
 # 6. LLM presents the results
 ```
@@ -190,39 +196,39 @@ All task intents go through the Orchestrator:
 ```python
 # Flow in _orchestrate_task():
 1. Set workspace context on Orchestrator
-2. Get next step (tool + params) from Orchestrator reasoning
+2. Get next step (tool + params) from Orchestrator
 3. Execute tool via Executor API
 4. Return formatted results for context injection
 
-# No hardcoded patterns - Orchestrator decides the tool
+# No hardcoded patterns—Orchestrator decides everything
 ```
 
 ### 3. Status Messages
 
-The filter shows clean status messages during processing:
+Live feedback while processing:
 
-| Icon | Status                |
-| ---- | --------------------- |
-| ✨   | Thinking / Processing |
-| 🔍   | Scanning workspace    |
-| 📖   | Reading files         |
-| ✏️   | Editing files         |
-| ⚙️   | Running code          |
-| 💾   | Saving to memory      |
-| 📚   | Memories found        |
-| ✅   | Ready / Complete      |
-| ❌   | Operation failed      |
+| Icon | What's happening   |
+| ---- | ------------------ |
+| ✨   | Thinking           |
+| 🔍   | Scanning workspace |
+| 📖   | Reading files      |
+| ✏️   | Editing files      |
+| ⚙️   | Running code       |
+| 💾   | Saving to memory   |
+| 📚   | Found memories     |
+| ✅   | Done               |
+| ❌   | Something broke    |
 
 ### 4. Memory Integration
 
-- **Save**: Facts extracted from conversation, embedded, stored in Qdrant
-- **Search**: Query embedded, similar memories retrieved (cosine similarity > 0.35)
-- **Inject**: Relevant memories prepended to LLM context
+- **Save**: Extracts facts from the conversation, embeds them, stores in Qdrant
+- **Search**: Embeds your query, finds similar memories (cosine > 0.35)
+- **Inject**: Prepends relevant memories to LLM context
 
 ## Quick Test
 
 ```powershell
-# Test executor file append
+# Test file append via Executor
 Invoke-RestMethod -Uri 'http://localhost:8005/api/execute/tool' -Method Post `
   -ContentType 'application/json' `
   -Body (@{
@@ -242,6 +248,8 @@ Invoke-RestMethod -Uri 'http://localhost:8001/api/pragmatics/classify' -Method P
   -Body (@{text='Add a credit to the readme'} | ConvertTo-Json)
 ```
 
+```
+
 ## License
 
 MIT
@@ -249,3 +257,4 @@ MIT
 ## Credits
 
 - **Ian Westerfield** - Creator and maintainer
+```
